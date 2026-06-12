@@ -51,6 +51,15 @@ class ConsumeTaskPlugin(abc.ABC):
 
     NAME: str = "ConsumeTaskPlugin"
 
+    # Optional class attributes for the plugin registry system.
+    # These are used by ConsumePluginRegistry when plugins are registered
+    # via class-level metadata rather than explicit register() arguments.
+    # They are not required — the registry accepts explicit values that
+    # take precedence over these class-level defaults.
+    PLUGIN_ID: str = ""
+    DEPENDENCIES: list[str] = []
+    ORDER_HINT: int = 0
+
     def __init__(
         self,
         input_doc: ConsumableDocument,

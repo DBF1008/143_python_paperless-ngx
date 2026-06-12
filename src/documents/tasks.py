@@ -19,24 +19,18 @@ from django.utils import timezone
 from filelock import FileLock
 
 from documents import sanity_checker
-from documents.barcodes import BarcodePlugin
 from documents.bulk_download import ArchiveOnlyStrategy
 from documents.bulk_download import OriginalsOnlyStrategy
 from documents.caching import clear_document_caches
 from documents.classifier import DocumentClassifier
 from documents.classifier import load_classifier
-from documents.consumer import AsnCheckPlugin
 from documents.consumer import ConsumeFileDuplicateError
-from documents.consumer import ConsumerPlugin
-from documents.consumer import ConsumerPreflightPlugin
-from documents.consumer import WorkflowTriggerPlugin
 from documents.consumer import should_produce_archive
 from documents.data_models import ConsumableDocument
 from documents.data_models import ConsumeFileDuplicateResult
 from documents.data_models import ConsumeFileStoppedResult
 from documents.data_models import ConsumeFileSuccessResult
 from documents.data_models import DocumentMetadataOverrides
-from documents.double_sided import CollatePlugin
 from documents.file_handling import create_source_path_directory
 from documents.file_handling import generate_unique_filename
 from documents.matching import prefilter_documents_by_workflowtrigger
@@ -55,6 +49,7 @@ from documents.plugins.base import ConsumeTaskPlugin
 from documents.plugins.base import StopConsumeTaskError
 from documents.plugins.helpers import ProgressManager
 from documents.plugins.helpers import ProgressStatusOptions
+from documents.plugins.registry import get_consume_plugin_registry
 from documents.sanity_checker import SanityCheckFailedException
 from documents.search._backend import SearchIndexLockError
 from documents.signals import document_updated
@@ -196,20 +191,11 @@ def consume_file(
             overrides = DocumentMetadataOverrides()
 
         plugins: list[type[ConsumeTaskPlugin]] = (
-            [
-                ConsumerPreflightPlugin,
-                ConsumerPlugin,
-            ]
-            if input_doc.root_document_id is not None
-            else [
-                ConsumerPreflightPlugin,
-                AsnCheckPlugin,
-                CollatePlugin,
-                BarcodePlugin,
-                AsnCheckPlugin,  # Re-run ASN check after barcode reading
-                WorkflowTriggerPlugin,
-                ConsumerPlugin,
-            ]
+            get_consume_plugin_registry().get_execution_chain(
+                "version_upload"
+                if input_doc.root_document_id is not None
+                else "default",
+            )
         )
 
         with (
