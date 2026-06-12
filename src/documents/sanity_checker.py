@@ -24,6 +24,7 @@ from documents.utils import IterWrapper
 from documents.utils import compute_checksum
 from documents.utils import identity
 from paperless.config import GeneralConfig
+from paperless.parsers.utils import is_valid_pdf
 
 logger = logging.getLogger("paperless.sanity_checker")
 
@@ -256,6 +257,15 @@ def _check_archive(
                     "Checksum mismatch of archived document. "
                     f"Stored: {doc.archive_checksum}, actual: {checksum}.",
                 )
+
+        # Integrity check beyond the checksum: a corrupt archive stored together
+        # with a checksum of its own corrupt bytes passes the comparison above.
+        # The archive is always a PDF in Paperless, so verify it parses.
+        if not is_valid_pdf(archive_path):
+            messages.error(
+                doc.pk,
+                "Archive file is corrupt or incomplete (not a valid PDF).",
+            )
 
 
 def _check_content(doc: Document, messages: SanityCheckMessages) -> None:

@@ -40,6 +40,7 @@ from documents.plugins.base import AlwaysRunPluginMixin
 from documents.plugins.base import ConsumeTaskPlugin
 from documents.plugins.base import NoCleanupPluginMixin
 from documents.plugins.base import NoSetupPluginMixin
+from documents.plugins.base import StopConsumeTaskError
 from documents.plugins.date_parsing import get_date_parser
 from documents.plugins.helpers import ProgressManager
 from documents.plugins.helpers import ProgressStatusOptions
@@ -60,6 +61,7 @@ from paperless.parsers.registry import get_parser_registry
 from paperless.parsers.utils import PDF_TEXT_MIN_LENGTH
 from paperless.parsers.utils import extract_pdf_text
 from paperless.parsers.utils import is_tagged_pdf
+from paperless.parsers.utils import is_valid_pdf
 
 LOGGING_NAME: Final[str] = "paperless.consumer"
 
@@ -583,6 +585,12 @@ class ConsumerPlugin(
                 )
                 # now that everything is done, we can start to store the document
                 # in the system. This will be a transaction and reasonably fast.
+                #
+                # Track files written to their production locations so that a
+                # rollback can also remove what it left on disk -- a database
+                # transaction.atomic() abort only rolls back the database, not
+                # files already copied into place.
+                written_files: list[Path] = []
                 try:
                     with transaction.atomic():
                         # store the document.
@@ -689,11 +697,13 @@ class ConsumerPlugin(
                                 else self.working_copy,
                                 document.source_path,
                             )
+                            written_files.append(document.source_path)
 
                             self._write(
                                 thumbnail,
                                 document.thumbnail_path,
                             )
+                            written_files.append(document.thumbnail_path)
 
                             if archive_path and Path(archive_path).is_file():
                                 generated_archive_filename = generate_unique_filename(
@@ -718,10 +728,24 @@ class ConsumerPlugin(
                                     archive_path,
                                     document.archive_path,
                                 )
+                                written_files.append(document.archive_path)
 
                                 document.archive_checksum = compute_checksum(
                                     document.archive_path,
                                 )
+
+                                # Verify the archive we just wrote is a non-empty,
+                                # parseable PDF before committing. Otherwise a
+                                # truncated/corrupt archive would be stored with a
+                                # checksum of its own corrupt bytes -- something no
+                                # later checksum comparison can ever detect. Raising
+                                # here aborts the atomic() block, rolling back the DB
+                                # and triggering cleanup of the files written above.
+                                if not is_valid_pdf(document.archive_path, self.log):
+                                    raise ConsumerError(
+                                        f"{self.filename}: generated archive file is "
+                                        f"corrupt or incomplete",
+                                    )
 
                         # Don't save with the lock active. Saving will cause the file
                         # renaming logic to acquire the lock as well.
@@ -735,30 +759,52 @@ class ConsumerPlugin(
                                 skip_ai_index=True,  # document_consumption_finished already enqueues the LLM update
                             )
 
-                        # Delete the file only if it was successfully consumed
-                        self.log.debug(
-                            f"Deleting original file {self.input_doc.original_file}",
-                        )
-                        self.input_doc.original_file.unlink()
-                        self.log.debug(f"Deleting working copy {self.working_copy}")
-                        self.working_copy.unlink()
-                        if self.unmodified_original is not None:  # pragma: no cover
+                        # Delete the irreversible input/working files only after
+                        # the transaction actually commits. Registering with
+                        # on_commit guarantees a rollback never destroys the source
+                        # input: if anything above fails the originals stay put and
+                        # the file can simply be re-consumed.
+                        def _cleanup_consumed_inputs() -> None:
                             self.log.debug(
-                                f"Deleting unmodified original file {self.unmodified_original}",
+                                f"Deleting original file {self.input_doc.original_file}",
                             )
-                            self.unmodified_original.unlink()
+                            self.input_doc.original_file.unlink(missing_ok=True)
+                            self.log.debug(
+                                f"Deleting working copy {self.working_copy}",
+                            )
+                            self.working_copy.unlink(missing_ok=True)
+                            if self.unmodified_original is not None:  # pragma: no cover
+                                self.log.debug(
+                                    f"Deleting unmodified original file "
+                                    f"{self.unmodified_original}",
+                                )
+                                self.unmodified_original.unlink(missing_ok=True)
 
-                        # https://github.com/jonaswinkler/paperless-ng/discussions/1037
-                        shadow_file = (
-                            Path(self.input_doc.original_file).parent
-                            / f"._{Path(self.input_doc.original_file).name}"
-                        )
+                            # https://github.com/jonaswinkler/paperless-ng/discussions/1037
+                            shadow_file = (
+                                Path(self.input_doc.original_file).parent
+                                / f"._{Path(self.input_doc.original_file).name}"
+                            )
+                            if Path(shadow_file).is_file():
+                                self.log.debug(f"Deleting shadow file {shadow_file}")
+                                Path(shadow_file).unlink()
 
-                        if Path(shadow_file).is_file():
-                            self.log.debug(f"Deleting shadow file {shadow_file}")
-                            Path(shadow_file).unlink()
+                        transaction.on_commit(_cleanup_consumed_inputs)
 
                 except Exception as e:
+                    # The atomic() block has already rolled back the database, but
+                    # any files written to their production locations above are still
+                    # on disk. Remove them so a failed consume leaves no orphans.
+                    with FileLock(settings.MEDIA_LOCK):
+                        for written in written_files:
+                            try:
+                                if Path(written).is_file():
+                                    Path(written).unlink()
+                            except OSError:
+                                self.log.warning(
+                                    "Could not clean up %s after rollback",
+                                    written,
+                                )
                     self._fail(
                         str(e),
                         f"The following error occurred while storing document "
@@ -987,6 +1033,48 @@ class ConsumerPreflightPlugin(
         )
         if existing_doc.exists():
             existing_doc = existing_doc.order_by("-created")
+
+            # Before treating this as a plain duplicate, check whether one of the
+            # matching documents was only partially consumed: it claims to have an
+            # archive (archive_filename is set) but the archive file is missing or
+            # corrupt. Re-consuming the same content is the only way a user can fix
+            # such a record, so repair it in place from its stored source rather
+            # than rejecting the upload as a duplicate.
+            broken = next(
+                (
+                    d
+                    for d in existing_doc
+                    if d.has_archive_version
+                    and not is_valid_pdf(d.archive_path, self.log)
+                ),
+                None,
+            )
+            if broken is not None:
+                # Imported lazily to avoid a circular import with documents.tasks.
+                from documents.tasks import (
+                    update_document_content_maybe_archive_file,
+                )
+
+                self.log.warning(
+                    f"Existing document #{broken.pk} has a missing or corrupt "
+                    f"archive; triggering a rebuild from its source instead of "
+                    f"rejecting {self.filename} as a duplicate.",
+                )
+                update_document_content_maybe_archive_file.delay(broken.pk)
+                # The same content already lives in the existing document's source,
+                # so the freshly uploaded copy is redundant once repair is queued.
+                Path(self.input_doc.original_file).unlink(missing_ok=True)
+                self._send_progress(
+                    100,
+                    100,
+                    ProgressStatusOptions.FAILED,
+                    "archive_repair_triggered",
+                )
+                raise StopConsumeTaskError(
+                    f"Repairing partially-consumed document #{broken.pk}; "
+                    f"skipping duplicate consume of {self.filename}.",
+                )
+
             duplicates_in_trash = existing_doc.filter(deleted_at__isnull=False)
             log_msg = (
                 f"Consuming duplicate {self.filename}: "

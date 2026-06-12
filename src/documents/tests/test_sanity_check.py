@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from documents.sanity_checker import check_sanity
+from documents.utils import compute_checksum
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -263,3 +264,49 @@ class TestCheckSanityLogMessages:
             messages.log_messages()
         assert "#99999" in caplog.text
         assert "Unknown" in caplog.text
+
+
+@pytest.mark.django_db
+class TestCheckSanityArchiveIntegrity:
+    """The archive PDF must be structurally valid, not merely checksum-consistent."""
+
+    def test_corrupt_archive_with_matching_checksum(
+        self,
+        sample_doc: Document,
+    ) -> None:
+        """The core blind spot: corrupt archive bytes stored with a checksum of
+        those same bytes pass the checksum comparison but must still be flagged.
+        """
+        archive = Path(sample_doc.archive_path)
+        archive.write_bytes(b"this is not a valid pdf at all")
+        # Store the checksum of the corrupt bytes so the checksum check passes.
+        sample_doc.archive_checksum = compute_checksum(archive)
+        sample_doc.save()
+
+        messages = check_sanity()
+
+        assert messages.has_error
+        assert any(
+            "corrupt or incomplete" in m["message"]
+            for m in messages[sample_doc.pk]
+        )
+        # The checksum comparison itself must NOT fire -- it matches the bytes.
+        assert not any(
+            "Checksum mismatch of archived" in m["message"]
+            for m in messages[sample_doc.pk]
+        )
+
+    def test_empty_archive_file(self, sample_doc: Document) -> None:
+        """A zero-byte archive (e.g. a partially written file) is flagged."""
+        archive = Path(sample_doc.archive_path)
+        archive.write_bytes(b"")
+        sample_doc.archive_checksum = compute_checksum(archive)
+        sample_doc.save()
+
+        messages = check_sanity()
+
+        assert messages.has_error
+        assert any(
+            "corrupt or incomplete" in m["message"]
+            for m in messages[sample_doc.pk]
+        )

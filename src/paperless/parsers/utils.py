@@ -170,6 +170,45 @@ def get_page_count_for_pdf(
         return None
 
 
+def is_valid_pdf(
+    path: Path,
+    log: logging.Logger | None = None,
+) -> bool:
+    """Return True if *path* is a non-empty, parseable PDF.
+
+    Used as an archive-integrity check.  A truncated or zero-byte file (e.g. a
+    partially written archive) cannot be opened by pikepdf, or fails when the
+    page tree is materialised, so this returns ``False`` for it.  This catches
+    the case where a corrupt archive was stored together with a checksum that
+    matches the corrupt bytes -- a plain checksum comparison cannot detect that.
+
+    Parameters
+    ----------
+    path:
+        Absolute path to the file to validate.
+    log:
+        Logger for warnings.  Falls back to the module-level logger when omitted.
+
+    Returns
+    -------
+    bool
+        ``True`` when the file exists, is non-empty and is a parseable PDF;
+        ``False`` otherwise or on any error.
+    """
+    import pikepdf
+
+    _log = log or logger
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        with pikepdf.Pdf.open(path) as pdf:
+            len(pdf.pages)  # force page-tree parse; truncated files raise here
+        return True
+    except Exception:
+        _log.warning("Archive integrity check failed for %s", path, exc_info=True)
+        return False
+
+
 def extract_pdf_metadata(
     document_path: Path,
     log: logging.Logger | None = None,
