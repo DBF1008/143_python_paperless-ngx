@@ -2,6 +2,7 @@ from collections.abc import Iterable
 
 import pytest
 from factory.django import DjangoModelFactory
+from pytest_mock import MockerFixture
 
 from documents import matching
 from documents.models import Document
@@ -361,6 +362,33 @@ class TestMatching:
             assert not matching.matches(tag, document)
 
         assert "timed out" in caplog.text
+
+    def test_content_length_limit_truncates(
+        self,
+        mocker: MockerFixture,
+    ) -> None:
+        """Documents whose content exceeds the configured limit should be
+        truncated before matching, so a keyword placed beyond the limit is
+        not found."""
+        mocker.patch("documents.matching.limit_content_length", return_value="x" * 100)
+        tag = TagFactory.build(
+            match="keyword",
+            matching_algorithm=MatchingModel.MATCH_ANY,
+        )
+        # The document content is replaced by 100 "x"s -- the original
+        # "keyword" at the end is gone after truncation.
+        document = Document(content=("x" * 100) + " keyword")
+        assert not matching.matches(tag, document)
+
+    def test_content_within_limit_matches_normally(self) -> None:
+        """Documents within the content length limit should match as
+        expected."""
+        tag = TagFactory.build(
+            match=r"\d+",
+            matching_algorithm=MatchingModel.MATCH_REGEX,
+        )
+        document = Document(content="invoice 12345")
+        assert matching.matches(tag, document)
 
     def test_match_fuzzy(
         self,

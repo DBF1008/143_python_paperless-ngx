@@ -20,6 +20,7 @@ from documents.models import Tag
 from documents.models import Workflow
 from documents.models import WorkflowTrigger
 from documents.permissions import get_objects_for_user_owner_aware
+from documents.regex import limit_content_length
 from documents.regex import safe_regex_search
 
 if TYPE_CHECKING:
@@ -169,7 +170,9 @@ def match_storage_paths(document: Document, classifier: DocumentClassifier, user
 def matches(matching_model: MatchingModel, document: Document):
     search_flags = 0
 
-    document_content = document.get_effective_content() or ""
+    document_content = limit_content_length(
+        document.get_effective_content() or "",
+    )
 
     # Check that match is not empty
     if not matching_model.match.strip():

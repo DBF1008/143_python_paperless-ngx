@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import regex; print\\(regex.__version__\\)\")",
+      "Bash(python3 -c \"import django; print\\(django.__version__\\)\")",
+      "Bash(python3 -c \"import pytest; print\\(pytest.__version__\\)\")"
+    ]
+  }
+}

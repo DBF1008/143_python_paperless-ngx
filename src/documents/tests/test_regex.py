@@ -2,6 +2,9 @@ import pytest
 import regex
 from pytest_mock import MockerFixture
 
+from documents.regex import is_unsafe_regex_pattern
+from documents.regex import limit_content_length
+from documents.regex import MATCH_CONTENT_MAX_LENGTH
 from documents.regex import safe_regex_finditer
 from documents.regex import safe_regex_match
 from documents.regex import safe_regex_search
@@ -131,3 +134,78 @@ class TestSafeRegexFinditer:
         mock_pattern.finditer.side_effect = TimeoutError
         mock_pattern.pattern = r"\d+"
         assert list(safe_regex_finditer(mock_pattern, "test")) == []
+
+
+class TestIsUnsafeRegexPattern:
+    """Static unsafe-pattern detection should flag known ReDoS constructs
+    while leaving common, legitimate patterns untouched."""
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            pytest.param(r"\d+", id="simple-quantifier"),
+            pytest.param(r"\w{3,10}", id="bounded-quantifier"),
+            pytest.param(r"\d{4}-\d{2}-\d{2}", id="date-format"),
+            pytest.param(r"(?:foo|bar)+", id="non-capturing-alternation"),
+            pytest.param(r"[\w\s]+", id="character-class-quantifier"),
+            pytest.param(r"(abc)+", id="group-no-inner-quantifier"),
+            pytest.param(r"(foo)?", id="optional-group"),
+            pytest.param(r"INV-\d{4}-\d{3}", id="invoice-number"),
+            pytest.param(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", id="email"),
+            pytest.param(r"^\d{1,3}(?:\.\d{1,3}){3}$", id="ip-address"),
+        ],
+    )
+    def test_safe_patterns_not_flagged(self, pattern: str) -> None:
+        assert not is_unsafe_regex_pattern(pattern), (
+            f"Pattern {pattern!r} should NOT be flagged as unsafe"
+        )
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            pytest.param(r"(a+)+", id="nested-plus"),
+            pytest.param(r"(\w+)*", id="nested-star"),
+            pytest.param(r"(a+)+$", id="classic-redos"),
+            pytest.param(r"(\d+)+", id="digit-nested"),
+            pytest.param(r"(a*)+", id="zero-min-group"),
+            pytest.param(r"(\s?)*", id="optional-in-star-group"),
+            pytest.param(r"a**", id="adjacent-star"),
+            pytest.param(r".*+", id="adjacent-dot-star"),
+        ],
+    )
+    def test_unsafe_patterns_flagged(self, pattern: str) -> None:
+        assert is_unsafe_regex_pattern(pattern), (
+            f"Pattern {pattern!r} should be flagged as unsafe"
+        )
+
+
+class TestValidateRegexPatternUnsafe:
+    def test_unsafe_pattern_raises(self) -> None:
+        with pytest.raises(ValueError, match="unsafe"):
+            validate_regex_pattern(r"(a+)+$")
+
+    def test_safe_pattern_passes(self) -> None:
+        validate_regex_pattern(r"\d{4}-\d{2}-\d{2}")
+
+    def test_invalid_syntax_still_raises(self) -> None:
+        with pytest.raises(ValueError):
+            validate_regex_pattern(r"[invalid")
+
+
+class TestLimitContentLength:
+    def test_short_content_unchanged(self) -> None:
+        assert limit_content_length("hello", max_length=100) == "hello"
+
+    def test_exact_limit_unchanged(self) -> None:
+        content = "x" * 100
+        assert limit_content_length(content, max_length=100) == content
+
+    def test_long_content_truncated(self) -> None:
+        content = "x" * 200
+        result = limit_content_length(content, max_length=100)
+        assert len(result) == 100
+        assert result == "x" * 100
+
+    def test_default_limit_is_generous(self) -> None:
+        # The default limit should be at least 1M characters
+        assert MATCH_CONTENT_MAX_LENGTH >= 1_000_000
