@@ -5,6 +5,8 @@ Verifies Rich rendering (table, panel, summary) and end-to-end CLI behavior.
 
 from __future__ import annotations
 
+import os
+import time
 from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,6 +16,7 @@ from django.core.management import call_command
 from rich.console import Console
 
 from documents.management.commands.document_sanity_checker import Command
+from documents.sanity_checker import OrphanAnalysis
 from documents.sanity_checker import SanityCheckMessages
 from documents.tests.factories import DocumentFactory
 
@@ -29,6 +32,30 @@ def _render_to_string(messages: SanityCheckMessages) -> str:
     cmd.console = Console(file=buf, width=120, no_color=True)
     cmd._render_results(messages)
     return buf.getvalue()
+
+
+def _render_orphan_to_string(orphans: OrphanAnalysis, *, removed: bool) -> str:
+    """Render only the orphan report to a plain string for assertion."""
+    buf = StringIO()
+    cmd = Command()
+    cmd.console = Console(file=buf, width=120, no_color=True)
+    cmd._render_orphan_report(orphans, removed=removed)
+    return buf.getvalue()
+
+
+def _make_orphan(
+    directory: Path,
+    name: str = "orphan.pdf",
+    *,
+    age_seconds: float = 0.0,
+) -> Path:
+    """Create a non-empty orphan file, optionally backdating its mtime."""
+    path = directory / name
+    path.write_bytes(b"orphan data")
+    if age_seconds:
+        past = time.time() - age_seconds
+        os.utime(path, (past, past))
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -206,3 +233,120 @@ class TestDocumentSanityCheckerCommand:
         output = out.getvalue()
         assert "ERROR" in output
         assert "Checksum mismatch. Stored: abc, actual:" in output
+
+
+# ---------------------------------------------------------------------------
+# Orphan report rendering (unit -- no DB, no command execution)
+# ---------------------------------------------------------------------------
+
+
+class TestRenderOrphanReport:
+    """Unit tests for _render_orphan_report against hand-built analyses."""
+
+    def test_no_orphans_renders_nothing(self) -> None:
+        output = _render_orphan_to_string(OrphanAnalysis(), removed=False)
+        assert output == ""
+
+    def test_report_only_shows_detected_and_hint(self) -> None:
+        orphans = OrphanAnalysis(orphans=[Path("/media/orphan.pdf")])
+        output = _render_orphan_to_string(orphans, removed=False)
+        assert "Orphaned Files" in output
+        assert "Detected" in output
+        # Report-only mode points the operator at the cleanup flag.
+        assert "--remove-orphans" in output
+
+    def test_removed_shows_stats_and_reclaimed(self) -> None:
+        path = Path("/media/orphan.pdf")
+        orphans = OrphanAnalysis(
+            orphans=[path],
+            removed=[path],
+            reclaimed_bytes=2048,
+        )
+        output = _render_orphan_to_string(orphans, removed=True)
+        assert "Removed" in output
+        assert "Skipped" in output
+        assert "Reclaimed" in output
+        assert "2.0 KiB" in output
+        # The cleanup hint is suppressed once removal has run.
+        assert "--remove-orphans" not in output
+
+    def test_removed_with_errors_shows_notice(self) -> None:
+        path = Path("/media/orphan.pdf")
+        orphans = OrphanAnalysis(
+            orphans=[path],
+            errors=[(path, "permission denied")],
+        )
+        output = _render_orphan_to_string(orphans, removed=True)
+        assert "Errors" in output
+        assert "could not" in output
+
+
+# ---------------------------------------------------------------------------
+# Orphan removal -- end-to-end command execution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+@pytest.mark.management
+class TestOrphanRemovalCommand:
+    """CLI behavior for orphan reporting and the optional cleanup pass."""
+
+    def test_report_only_shows_detected_and_hint(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        """Without --remove-orphans the file is reported but never deleted."""
+        orphan = _make_orphan(paperless_dirs.originals, age_seconds=10_000)
+        out = StringIO()
+        call_command(
+            "document_sanity_checker",
+            "--no-progress-bar",
+            stdout=out,
+            skip_checks=True,
+        )
+        output = out.getvalue()
+        assert orphan.exists()
+        assert "Orphaned Files" in output
+        assert "Detected" in output
+        assert "--remove-orphans" in output
+
+    def test_remove_grace_zero_deletes_orphan(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        orphan = _make_orphan(paperless_dirs.originals, age_seconds=10_000)
+        out = StringIO()
+        call_command(
+            "document_sanity_checker",
+            "--remove-orphans",
+            "--orphan-grace-seconds",
+            "0",
+            "--no-progress-bar",
+            stdout=out,
+            skip_checks=True,
+        )
+        output = out.getvalue()
+        assert not orphan.exists()
+        assert "Orphaned Files" in output
+        assert "Removed" in output
+
+    def test_remove_default_grace_skips_recent(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        """A file modified within the grace window is reported but kept."""
+        orphan = _make_orphan(paperless_dirs.originals)  # mtime = now
+        out = StringIO()
+        call_command(
+            "document_sanity_checker",
+            "--remove-orphans",
+            "--no-progress-bar",
+            stdout=out,
+            skip_checks=True,
+        )
+        output = out.getvalue()
+        assert orphan.exists()
+        assert "Skipped" in output

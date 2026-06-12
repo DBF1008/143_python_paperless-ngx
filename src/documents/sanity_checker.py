@@ -10,14 +10,19 @@ is an identity function that adds no overhead.
 """
 
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Iterator
+from contextlib import nullcontext
+from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Final
 from typing import TypedDict
 
 from django.conf import settings
+from filelock import FileLock
 
 from documents.models import Document
 from documents.utils import IterWrapper
@@ -26,6 +31,50 @@ from documents.utils import identity
 from paperless.config import GeneralConfig
 
 logger = logging.getLogger("paperless.sanity_checker")
+
+# When removing orphans, files modified within this many seconds are left
+# alone: they may belong to an in-flight consume_file whose database record
+# has not been committed yet. Overridable per call.
+DEFAULT_ORPHAN_GRACE_SECONDS: Final[int] = 60
+
+
+@dataclass
+class OrphanAnalysis:
+    """Structured report of orphaned files found in ``MEDIA_ROOT``.
+
+    ``orphans`` lists every file detected as orphaned (always populated, and
+    also surfaced as warnings on the ``SanityCheckMessages``). The remaining
+    fields describe the outcome of an optional cleanup pass:
+
+    - ``removed``: files that were successfully deleted.
+    - ``skipped``: files left in place because they were modified within the
+      grace window -- they may belong to an in-flight ``consume_file`` whose
+      database record is not yet committed.
+    - ``errors``: ``(path, reason)`` pairs for files that could not be removed.
+    - ``reclaimed_bytes``: total size freed by ``removed`` files.
+    """
+
+    orphans: list[Path] = field(default_factory=list)
+    removed: list[Path] = field(default_factory=list)
+    skipped: list[Path] = field(default_factory=list)
+    errors: list[tuple[Path, str]] = field(default_factory=list)
+    reclaimed_bytes: int = 0
+
+    @property
+    def orphan_count(self) -> int:
+        return len(self.orphans)
+
+    @property
+    def removed_count(self) -> int:
+        return len(self.removed)
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped)
+
+    @property
+    def error_count(self) -> int:
+        return len(self.errors)
 
 
 class MessageEntry(TypedDict):
@@ -53,6 +102,8 @@ class SanityCheckMessages:
         self.document_warning_count: int = 0
         self.document_info_count: int = 0
         self.global_warning_count: int = 0
+        # Structured orphan report, populated by check_sanity().
+        self.orphans: OrphanAnalysis = OrphanAnalysis()
 
     # -- Recording ----------------------------------------------------------
 
@@ -276,6 +327,73 @@ def _check_document(
     _check_content(doc, messages)
 
 
+def _process_orphans(
+    candidates: set[Path],
+    messages: SanityCheckMessages,
+    *,
+    remove: bool,
+    grace_seconds: int,
+    use_lock: bool,
+    iter_wrapper: IterWrapper[Path],
+) -> None:
+    """Report orphaned files and, optionally, delete them safely.
+
+    Every candidate is reported as a warning, preserving the historical
+    behaviour of the sanity checker. When ``remove`` is True the deletion pass
+    runs under ``FileLock(settings.MEDIA_LOCK)`` (unless ``use_lock`` is False)
+    so it cannot race with ``consume_file`` moving a file into ``MEDIA_ROOT``,
+    and any file modified within ``grace_seconds`` is left in place because it
+    may be an in-flight consume whose database record is not yet committed.
+
+    Cleanup outcomes are recorded on ``messages.orphans`` (and logged); they
+    are deliberately not added to the message log to avoid duplicating the
+    per-orphan warnings already emitted above.
+    """
+    analysis = messages.orphans
+    # Sort for deterministic reporting, progress, and test assertions.
+    ordered = sorted(candidates)
+
+    for path in ordered:
+        analysis.orphans.append(path)
+        messages.warning(None, f"Orphaned file in media dir: {path}")
+
+    if not remove or not ordered:
+        return
+
+    cutoff = time.time() - grace_seconds
+    lock = FileLock(settings.MEDIA_LOCK) if use_lock else nullcontext()
+    with lock:
+        for path in iter_wrapper(ordered):
+            try:
+                file_stat = path.stat()
+            except FileNotFoundError:
+                # Removed by another process between detection and cleanup.
+                continue
+            except OSError as e:
+                analysis.errors.append((path, str(e)))
+                logger.warning("Could not stat orphaned file %s: %s", path, e)
+                continue
+
+            if file_stat.st_mtime > cutoff:
+                analysis.skipped.append(path)
+                logger.info(
+                    "Skipping recently modified orphan (possible in-flight "
+                    "consume): %s",
+                    path,
+                )
+                continue
+
+            try:
+                path.unlink()
+            except OSError as e:
+                analysis.errors.append((path, str(e)))
+                logger.warning("Failed to remove orphaned file %s: %s", path, e)
+            else:
+                analysis.removed.append(path)
+                analysis.reclaimed_bytes += file_stat.st_size
+                logger.info("Removed orphaned file: %s", path)
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -284,15 +402,32 @@ def _check_document(
 def check_sanity(
     *,
     iter_wrapper: IterWrapper[Document] = identity,
+    remove_orphans: bool = False,
+    use_lock: bool = True,
+    orphan_grace_seconds: int = DEFAULT_ORPHAN_GRACE_SECONDS,
+    orphan_iter_wrapper: IterWrapper[Path] = identity,
 ) -> SanityCheckMessages:
     """Run a full sanity check on the document archive.
 
     Args:
         iter_wrapper: A callable that wraps the document iterable, e.g.,
             for progress bar display. Defaults to identity (no wrapping).
+        remove_orphans: When True, delete orphaned files found in the media
+            directory. Deletion runs under the media lock and skips files
+            modified within ``orphan_grace_seconds``. Defaults to False
+            (report only).
+        use_lock: When True (default), the optional orphan deletion pass holds
+            ``FileLock(settings.MEDIA_LOCK)`` so it cannot race with file moves
+            performed by ``consume_file``. Only relevant when
+            ``remove_orphans`` is True.
+        orphan_grace_seconds: When removing orphans, files modified within this
+            many seconds are skipped as possible in-flight consumes.
+        orphan_iter_wrapper: A callable that wraps the orphan deletion iterable
+            for progress display. Defaults to identity (no wrapping).
 
     Returns:
-        A SanityCheckMessages instance containing all detected issues.
+        A SanityCheckMessages instance containing all detected issues. The
+        structured orphan report is available on ``messages.orphans``.
     """
     messages = SanityCheckMessages()
     present_files = _build_present_files()
@@ -309,7 +444,13 @@ def check_sanity(
     for doc in iter_wrapper(documents):
         _check_document(doc, messages, present_files)
 
-    for extra_file in present_files:
-        messages.warning(None, f"Orphaned file in media dir: {extra_file}")
+    _process_orphans(
+        present_files,
+        messages,
+        remove=remove_orphans,
+        grace_seconds=orphan_grace_seconds,
+        use_lock=use_lock,
+        iter_wrapper=orphan_iter_wrapper,
+    )
 
     return messages

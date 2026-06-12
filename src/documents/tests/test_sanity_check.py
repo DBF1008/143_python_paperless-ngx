@@ -7,6 +7,8 @@ orphan detection, and the iter_wrapper contract.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -263,3 +265,153 @@ class TestCheckSanityLogMessages:
             messages.log_messages()
         assert "#99999" in caplog.text
         assert "Unknown" in caplog.text
+
+
+def _make_orphan(
+    directory: Path,
+    name: str = "orphan.pdf",
+    *,
+    age_seconds: float = 0.0,
+) -> Path:
+    """Create a non-empty orphan file, optionally backdating its mtime."""
+    path = directory / name
+    path.write_bytes(b"orphan data")
+    if age_seconds:
+        past = time.time() - age_seconds
+        os.utime(path, (past, past))
+    return path
+
+
+@pytest.mark.django_db
+class TestCheckSanityOrphanRemoval:
+    """Optional orphan cleanup: safety, grace window, lock, and progress."""
+
+    def test_remove_deletes_old_orphan(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        orphan = _make_orphan(paperless_dirs.originals, age_seconds=10_000)
+        messages = check_sanity(remove_orphans=True)
+        assert not orphan.exists()
+        assert orphan.resolve() in messages.orphans.removed
+        assert messages.orphans.removed_count == 1
+        assert messages.orphans.reclaimed_bytes > 0
+        # Still reported as a warning, like detection-only mode.
+        assert messages.has_warning
+
+    def test_remove_skips_recent_orphan(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        """A file modified within the grace window is reported but not deleted."""
+        orphan = _make_orphan(paperless_dirs.originals)  # mtime = now
+        messages = check_sanity(remove_orphans=True)  # default 60s grace
+        assert orphan.exists()
+        assert orphan.resolve() in messages.orphans.skipped
+        assert messages.orphans.removed_count == 0
+        assert messages.has_warning
+
+    def test_grace_zero_removes_recent_orphan(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        orphan = _make_orphan(paperless_dirs.originals)  # mtime = now
+        messages = check_sanity(remove_orphans=True, orphan_grace_seconds=0)
+        assert not orphan.exists()
+        assert orphan.resolve() in messages.orphans.removed
+
+    def test_report_only_does_not_delete(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        """Default (remove_orphans=False) reports but never deletes."""
+        orphan = _make_orphan(paperless_dirs.originals, age_seconds=10_000)
+        messages = check_sanity()
+        assert orphan.exists()
+        assert messages.has_warning
+        assert orphan.resolve() in messages.orphans.orphans
+        assert messages.orphans.removed_count == 0
+        assert messages.orphans.skipped_count == 0
+
+    def test_remove_acquires_media_lock(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+        settings,
+        mocker,
+    ) -> None:
+        orphan = _make_orphan(paperless_dirs.originals, age_seconds=10_000)
+        lock_mock = mocker.patch("documents.sanity_checker.FileLock")
+        messages = check_sanity(remove_orphans=True, use_lock=True)
+        lock_mock.assert_called_once_with(settings.MEDIA_LOCK)
+        # The mocked lock is a no-op context manager; deletion still happens.
+        assert not orphan.exists()
+        assert messages.orphans.removed_count == 1
+
+    def test_use_lock_false_skips_lock(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+        mocker,
+    ) -> None:
+        orphan = _make_orphan(paperless_dirs.originals, age_seconds=10_000)
+        lock_mock = mocker.patch("documents.sanity_checker.FileLock")
+        messages = check_sanity(remove_orphans=True, use_lock=False)
+        lock_mock.assert_not_called()
+        assert not orphan.exists()
+        assert messages.orphans.removed_count == 1
+
+    def test_orphan_iter_wrapper_wraps_cleanup(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        _make_orphan(paperless_dirs.originals, age_seconds=10_000)
+        seen: list[Path] = []
+
+        def tracking(paths: Iterable[Path]) -> Iterable[Path]:
+            for p in paths:
+                seen.append(p)
+                yield p
+
+        messages = check_sanity(remove_orphans=True, orphan_iter_wrapper=tracking)
+        assert len(seen) == 1
+        assert messages.orphans.removed_count == 1
+
+    def test_removal_failure_recorded(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+        mocker,
+    ) -> None:
+        orphan = _make_orphan(paperless_dirs.originals, age_seconds=10_000)
+        mocker.patch.object(Path, "unlink", side_effect=OSError("denied"))
+        messages = check_sanity(remove_orphans=True)
+        assert orphan.exists()
+        assert messages.orphans.error_count == 1
+        assert messages.orphans.removed_count == 0
+        failed_path, reason = messages.orphans.errors[0]
+        assert failed_path == orphan.resolve()
+        assert "denied" in reason
+
+    def test_removal_handles_file_vanished_before_cleanup(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        """A candidate removed between detection and cleanup is silently skipped."""
+        _make_orphan(paperless_dirs.originals, age_seconds=10_000)
+
+        def vanish(paths: Iterable[Path]) -> Iterable[Path]:
+            for p in paths:
+                p.unlink()  # disappears before _process_orphans stats it
+                yield p
+
+        messages = check_sanity(remove_orphans=True, orphan_iter_wrapper=vanish)
+        assert messages.orphans.removed_count == 0
+        assert messages.orphans.error_count == 0
+        assert messages.orphans.skipped_count == 0
