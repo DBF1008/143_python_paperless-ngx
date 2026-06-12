@@ -51,10 +51,10 @@ from documents.models import StoragePath
 from documents.models import Tag
 from documents.models import WorkflowRun
 from documents.models import WorkflowTrigger
-from documents.plugins.base import ConsumeTaskPlugin
 from documents.plugins.base import StopConsumeTaskError
 from documents.plugins.helpers import ProgressManager
 from documents.plugins.helpers import ProgressStatusOptions
+from documents.plugins.registry import consume_task_registry
 from documents.sanity_checker import SanityCheckFailedException
 from documents.search._backend import SearchIndexLockError
 from documents.signals import document_updated
@@ -76,6 +76,66 @@ from paperless_ai.indexing import update_llm_index
 if settings.AUDIT_LOG_ENABLED:
     from auditlog.models import LogEntry
 logger = logging.getLogger("paperless.tasks")
+
+
+def _is_full_pipeline(input_doc: ConsumableDocument) -> bool:
+    """
+    The full preprocessing pipeline only applies to top-level documents. A document
+    that is a new version of an existing one (root_document_id set) only needs the
+    preflight checks and the consumer itself.
+    """
+    return input_doc.root_document_id is None
+
+
+# Built-in consume pipeline steps, registered in the legacy execution order. Ordering
+# is derived from the declared `after` dependencies via a stable topological sort, with
+# registration order as the tie-breaker, so the result matches the previously hardcoded
+# chains exactly. Additional plugins can be registered from anywhere without editing
+# consume_file. AsnCheckPlugin runs twice: once up front, and once after BarcodePlugin
+# so it can validate any ASN read from a barcode.
+consume_task_registry.register("preflight", ConsumerPreflightPlugin)
+consume_task_registry.register(
+    "asn_check_pre",
+    AsnCheckPlugin,
+    after=("preflight",),
+    condition=_is_full_pipeline,
+)
+consume_task_registry.register(
+    "collate",
+    CollatePlugin,
+    after=("preflight",),
+    condition=_is_full_pipeline,
+)
+consume_task_registry.register(
+    "barcode",
+    BarcodePlugin,
+    after=("preflight",),
+    condition=_is_full_pipeline,
+)
+consume_task_registry.register(
+    "asn_check_post",
+    AsnCheckPlugin,
+    after=("barcode",),
+    condition=_is_full_pipeline,
+)
+consume_task_registry.register(
+    "workflow_trigger",
+    WorkflowTriggerPlugin,
+    after=("preflight",),
+    condition=_is_full_pipeline,
+)
+consume_task_registry.register(
+    "consumer",
+    ConsumerPlugin,
+    after=(
+        "preflight",
+        "asn_check_pre",
+        "collate",
+        "barcode",
+        "asn_check_post",
+        "workflow_trigger",
+    ),
+)
 
 
 @shared_task
@@ -195,22 +255,7 @@ def consume_file(
         if overrides is None:
             overrides = DocumentMetadataOverrides()
 
-        plugins: list[type[ConsumeTaskPlugin]] = (
-            [
-                ConsumerPreflightPlugin,
-                ConsumerPlugin,
-            ]
-            if input_doc.root_document_id is not None
-            else [
-                ConsumerPreflightPlugin,
-                AsnCheckPlugin,
-                CollatePlugin,
-                BarcodePlugin,
-                AsnCheckPlugin,  # Re-run ASN check after barcode reading
-                WorkflowTriggerPlugin,
-                ConsumerPlugin,
-            ]
-        )
+        pipeline = consume_task_registry.build_pipeline(input_doc)
 
         with (
             ProgressManager(
@@ -221,7 +266,8 @@ def consume_file(
         ):
             tmp_dir = Path(tmp_dir)
             msg = None
-            for plugin_class in plugins:
+            for step in pipeline:
+                plugin_class = step.plugin_class
                 plugin_name = plugin_class.NAME
 
                 plugin = plugin_class(

@@ -795,6 +795,13 @@ CONSUMER_DELETE_DUPLICATES = get_bool_from_env("PAPERLESS_CONSUMER_DELETE_DUPLIC
 
 CONSUMER_RECURSIVE = get_bool_from_env("PAPERLESS_CONSUMER_RECURSIVE")
 
+# Names of consume task plugin steps to disable, e.g. "barcode,collate". Lets an
+# operator turn off a misbehaving plugin without code changes (requires a worker
+# restart to take effect). Step names are those registered in documents.tasks.
+CONSUMER_DISABLED_PLUGINS: Final[list[str]] = get_list_from_env(
+    "PAPERLESS_CONSUMER_DISABLED_PLUGINS",
+)
+
 # Ignore regex patterns, matched against filename only
 CONSUMER_IGNORE_PATTERNS = list(
     json.loads(
