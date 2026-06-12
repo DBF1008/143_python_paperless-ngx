@@ -1894,3 +1894,127 @@ class WorkflowRun(SoftDeleteModel):
 
     def __str__(self) -> str:
         return f"WorkflowRun of {self.workflow} at {self.run_at} on {self.document}"
+
+
+class BulkEditJob(ModelWithOwner):
+    """
+    Tracks the overall progress and status of a bulk edit operation.
+    Each API request that opts into progress tracking creates one BulkEditJob
+    with one BulkEditJobItem per target document.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", _("Pending")
+        STARTED = "started", _("Started")
+        COMPLETE = "complete", _("Complete")
+        FAILED = "failed", _("Failed")
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+    )
+
+    method = models.CharField(
+        max_length=50,
+        verbose_name=_("Method"),
+        help_text=_("The bulk edit method name, e.g. 'set_correspondent'"),
+    )
+
+    total_documents = models.PositiveIntegerField(
+        default=0,
+        verbose_name=_("Total documents"),
+    )
+
+    completed_documents = models.PositiveIntegerField(
+        default=0,
+        verbose_name=_("Completed documents"),
+    )
+
+    failed_documents = models.PositiveIntegerField(
+        default=0,
+        verbose_name=_("Failed documents"),
+    )
+
+    use_transaction = models.BooleanField(
+        default=False,
+        verbose_name=_("Use transaction"),
+        help_text=_("Whether the entire operation is wrapped in a database transaction"),
+    )
+
+    date_created = models.DateTimeField(
+        default=timezone.now,
+        db_index=True,
+    )
+
+    date_done = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    error_message = models.TextField(
+        blank=True,
+        default="",
+    )
+
+    class Meta:
+        verbose_name = _("bulk edit job")
+        verbose_name_plural = _("bulk edit jobs")
+        ordering = ["-date_created"]
+
+    def __str__(self) -> str:
+        return f"BulkEditJob {self.pk} ({self.method}) [{self.status}]"
+
+    @property
+    def is_complete(self) -> bool:
+        return self.status in (self.Status.COMPLETE, self.Status.FAILED)
+
+
+class BulkEditJobItem(models.Model):
+    """
+    Tracks the per-document result within a BulkEditJob.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", _("Pending")
+        SUCCESS = "success", _("Success")
+        FAILURE = "failure", _("Failure")
+        SKIPPED = "skipped", _("Skipped")
+        CONFLICT = "conflict", _("Conflict")
+
+    job = models.ForeignKey(
+        BulkEditJob,
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+
+    document = models.ForeignKey(
+        Document,
+        on_delete=models.CASCADE,
+        related_name="bulk_edit_items",
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+    )
+
+    error_message = models.TextField(
+        blank=True,
+        default="",
+    )
+
+    date_done = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        verbose_name = _("bulk edit job item")
+        verbose_name_plural = _("bulk edit job items")
+        unique_together = [("job", "document")]
+
+    def __str__(self) -> str:
+        return f"BulkEditJobItem job={self.job_id} doc={self.document_id} [{self.status}]"

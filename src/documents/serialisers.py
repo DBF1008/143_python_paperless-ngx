@@ -1732,6 +1732,25 @@ class BulkEditSerializer(
     parameters = serializers.DictField(allow_empty=True, default={}, write_only=True)
     from_webui = serializers.BooleanField(required=False, default=False)
 
+    # Optional: wrap the entire batch in a single database transaction so that
+    # any failure rolls back all changes.
+    use_transaction = serializers.BooleanField(required=False, default=False)
+
+    # Optional: optimistic-locking map of {doc_id: ISO-8601 timestamp}.
+    # If any document's current ``modified`` timestamp differs from the
+    # supplied value the request is rejected with 409 Conflict.
+    expected_modified = serializers.DictField(
+        required=False,
+        default=dict,
+        allow_empty=True,
+        child=serializers.CharField(),
+    )
+
+    # Optional: create a BulkEditJob to track per-document progress.
+    # When true, a ``job_id`` is returned in the response and callers can
+    # poll ``/api/bulk_edit/job/<id>/`` for status updates.
+    track_progress = serializers.BooleanField(required=False, default=False)
+
     def _validate_tag_id_list(self, tags, name="tags") -> None:
         if not isinstance(tags, list):
             raise serializers.ValidationError(f"{name} must be a list")
@@ -2082,7 +2101,62 @@ class BulkEditSerializer(
         elif method == bulk_edit.remove_password:
             self.validate_parameters_remove_password(parameters)
 
+        # Normalise expected_modified keys to int and validate
+        expected_modified = attrs.get("expected_modified", {})
+        if expected_modified:
+            normalised: dict[int, str] = {}
+            doc_id_set = set(attrs.get("documents", []))
+            for key, value in expected_modified.items():
+                try:
+                    int_key = int(key)
+                except (ValueError, TypeError):
+                    raise serializers.ValidationError(
+                        f"expected_modified keys must be integers, got '{key}'",
+                    )
+                if doc_id_set and int_key not in doc_id_set:
+                    raise serializers.ValidationError(
+                        f"expected_modified key {int_key} is not in the document list",
+                    )
+                normalised[int_key] = str(value)
+            attrs["expected_modified"] = normalised
+
         return attrs
+
+
+class BulkEditJobItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        from documents.models import BulkEditJobItem
+
+        model = BulkEditJobItem
+        fields = [
+            "document",
+            "status",
+            "error_message",
+            "date_done",
+        ]
+
+
+class BulkEditJobStatusSerializer(serializers.ModelSerializer):
+    items = BulkEditJobItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        from documents.models import BulkEditJob
+
+        model = BulkEditJob
+        fields = [
+            "id",
+            "status",
+            "method",
+            "total_documents",
+            "completed_documents",
+            "failed_documents",
+            "use_transaction",
+            "date_created",
+            "date_done",
+            "error_message",
+            "items",
+        ]
+        read_only_fields = fields
 
 
 class PostDocumentSerializer(serializers.Serializer[dict[str, Any]]):

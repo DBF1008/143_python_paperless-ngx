@@ -1836,3 +1836,290 @@ class TestBulkEditAPI(DirectoriesMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(LogEntry.objects.filter(object_pk=self.doc1.id).count(), 2)
+
+
+class TestBulkEditConflictAPI(DirectoriesMixin, APITestCase):
+    """Tests for the conflict detection API integration."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        user = User.objects.create_superuser(username="conflict_admin")
+        self.client.force_authenticate(user=user)
+
+        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
+        self.async_task = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.c1 = Correspondent.objects.create(name="c1")
+        self.doc1 = Document.objects.create(checksum="A", title="A")
+        self.doc2 = Document.objects.create(checksum="B", title="B")
+
+    def test_conflict_returns_409(self) -> None:
+        """
+        GIVEN:
+            - expected_modified has a stale timestamp
+        WHEN:
+            - Bulk edit API is called with conflict detection
+        THEN:
+            - Response is 409 CONFLICT with conflict details
+        """
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "documents": [self.doc1.id, self.doc2.id],
+                    "method": "set_correspondent",
+                    "parameters": {"correspondent": self.c1.id},
+                    "expected_modified": {
+                        str(self.doc1.id): "2020-01-01T00:00:00+00:00",
+                        str(self.doc2.id): "2020-01-01T00:00:00+00:00",
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        data = response.json()
+        self.assertIn("conflicts", data)
+        self.assertIn(str(self.doc1.id), data["conflicts"])
+        self.assertIn(str(self.doc2.id), data["conflicts"])
+
+    def test_no_conflict_with_matching_timestamps(self) -> None:
+        """
+        GIVEN:
+            - expected_modified matches actual timestamps
+        WHEN:
+            - Bulk edit API is called
+        THEN:
+            - Response is 200 OK and changes are applied
+        """
+        self.doc1.refresh_from_db()
+        self.doc2.refresh_from_db()
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "documents": [self.doc1.id, self.doc2.id],
+                    "method": "set_correspondent",
+                    "parameters": {"correspondent": self.c1.id},
+                    "expected_modified": {
+                        str(self.doc1.id): self.doc1.modified.isoformat(),
+                        str(self.doc2.id): self.doc2.modified.isoformat(),
+                    },
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.doc1.refresh_from_db()
+        self.assertEqual(self.doc1.correspondent, self.c1)
+
+
+class TestBulkEditTransactionAPI(DirectoriesMixin, APITestCase):
+    """Tests for the transaction mode API integration."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        user = User.objects.create_superuser(username="txn_admin")
+        self.client.force_authenticate(user=user)
+
+        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
+        self.async_task = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.c1 = Correspondent.objects.create(name="c1")
+        self.doc1 = Document.objects.create(checksum="A", title="A")
+        self.doc2 = Document.objects.create(checksum="B", title="B")
+
+    def test_use_transaction_applies_changes(self) -> None:
+        """
+        GIVEN:
+            - use_transaction=True
+        WHEN:
+            - Bulk edit succeeds
+        THEN:
+            - Changes are committed and visible
+        """
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "documents": [self.doc1.id, self.doc2.id],
+                    "method": "set_correspondent",
+                    "parameters": {"correspondent": self.c1.id},
+                    "use_transaction": True,
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.doc1.refresh_from_db()
+        self.doc2.refresh_from_db()
+        self.assertEqual(self.doc1.correspondent, self.c1)
+        self.assertEqual(self.doc2.correspondent, self.c1)
+
+    def test_use_transaction_rolls_back_on_error(self) -> None:
+        """
+        GIVEN:
+            - use_transaction=True
+        WHEN:
+            - Bulk edit raises an error mid-way
+        THEN:
+            - All changes are rolled back
+        """
+        with mock.patch(
+            "documents.bulk_edit.set_correspondent",
+            side_effect=RuntimeError("simulated failure"),
+        ):
+            response = self.client.post(
+                "/api/documents/bulk_edit/",
+                json.dumps(
+                    {
+                        "documents": [self.doc1.id, self.doc2.id],
+                        "method": "set_correspondent",
+                        "parameters": {"correspondent": self.c1.id},
+                        "use_transaction": True,
+                    },
+                ),
+                content_type="application/json",
+            )
+        # Should return error
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        # No changes should be visible
+        self.doc1.refresh_from_db()
+        self.doc2.refresh_from_db()
+        self.assertIsNone(self.doc1.correspondent)
+        self.assertIsNone(self.doc2.correspondent)
+
+
+class TestBulkEditProgressTrackingAPI(DirectoriesMixin, APITestCase):
+    """Tests for the progress tracking API integration."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.user = User.objects.create_superuser(username="progress_admin")
+        self.client.force_authenticate(user=self.user)
+
+        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
+        self.async_task = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.c1 = Correspondent.objects.create(name="c1")
+        self.doc1 = Document.objects.create(checksum="A", title="A")
+        self.doc2 = Document.objects.create(checksum="B", title="B")
+
+    @mock.patch("documents.bulk_edit.run_bulk_edit.apply_async")
+    def test_track_progress_creates_job(self, mock_apply_async) -> None:
+        """
+        GIVEN:
+            - track_progress=True
+        WHEN:
+            - Bulk edit API is called
+        THEN:
+            - A BulkEditJob is created with items
+            - Response contains job_id and status_url (202 Accepted)
+            - run_bulk_edit task is dispatched
+        """
+        from documents.models import BulkEditJob, BulkEditJobItem
+
+        response = self.client.post(
+            "/api/documents/bulk_edit/",
+            json.dumps(
+                {
+                    "documents": [self.doc1.id, self.doc2.id],
+                    "method": "set_correspondent",
+                    "parameters": {"correspondent": self.c1.id},
+                    "track_progress": True,
+                },
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        data = response.json()
+        self.assertIn("job_id", data)
+        self.assertIn("status_url", data)
+
+        # Verify job and items were created
+        job = BulkEditJob.objects.get(pk=data["job_id"])
+        self.assertEqual(job.method, "set_correspondent")
+        self.assertEqual(job.total_documents, 2)
+        self.assertEqual(job.status, BulkEditJob.Status.PENDING)
+        self.assertEqual(BulkEditJobItem.objects.filter(job=job).count(), 2)
+
+        # Verify the Celery task was dispatched
+        mock_apply_async.assert_called_once()
+
+    def test_job_status_endpoint(self) -> None:
+        """
+        GIVEN:
+            - A BulkEditJob exists
+        WHEN:
+            - GET /api/documents/bulk_edit/job/<id>/ is called
+        THEN:
+            - Job status and items are returned
+        """
+        from documents.models import BulkEditJob, BulkEditJobItem
+
+        job = BulkEditJob.objects.create(
+            owner=self.user,
+            method="set_correspondent",
+            total_documents=2,
+            status=BulkEditJob.Status.COMPLETE,
+            completed_documents=2,
+        )
+        BulkEditJobItem.objects.create(
+            job=job,
+            document=self.doc1,
+            status=BulkEditJobItem.Status.SUCCESS,
+        )
+        BulkEditJobItem.objects.create(
+            job=job,
+            document=self.doc2,
+            status=BulkEditJobItem.Status.SUCCESS,
+        )
+
+        response = self.client.get(f"/api/documents/bulk_edit/job/{job.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.json()
+        self.assertEqual(data["status"], "complete")
+        self.assertEqual(data["total_documents"], 2)
+        self.assertEqual(data["completed_documents"], 2)
+        self.assertEqual(len(data["items"]), 2)
+        for item in data["items"]:
+            self.assertEqual(item["status"], "success")
+
+    def test_job_status_not_found(self) -> None:
+        """
+        GIVEN:
+            - No BulkEditJob with the given ID
+        WHEN:
+            - GET /api/documents/bulk_edit/job/99999/ is called
+        THEN:
+            - Response is 404
+        """
+        response = self.client.get("/api/documents/bulk_edit/job/99999/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_job_status_permission_check(self) -> None:
+        """
+        GIVEN:
+            - A BulkEditJob owned by a different user
+        WHEN:
+            - A non-superuser tries to access it
+        THEN:
+            - Response is 403 Forbidden
+        """
+        from documents.models import BulkEditJob
+
+        other_user = User.objects.create(username="other_user")
+        job = BulkEditJob.objects.create(
+            owner=other_user,
+            method="set_correspondent",
+            total_documents=1,
+        )
+
+        non_admin = User.objects.create(username="non_admin")
+        self.client.force_authenticate(user=non_admin)
+
+        response = self.client.get(f"/api/documents/bulk_edit/job/{job.pk}/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

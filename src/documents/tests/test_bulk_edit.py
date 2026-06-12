@@ -1674,3 +1674,345 @@ class TestPDFActions(DirectoriesMixin, TestCase):
 
         self.assertIn("wrong password", str(exc.exception))
         self.assertIn("Error removing password from document", cm.output[0])
+
+
+class TestConflictDetection(DirectoriesMixin, TestCase):
+    """Tests for optimistic-locking conflict detection."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from datetime import date
+
+        self.doc1 = Document.objects.create(checksum="A", title="A", created=date(2023, 1, 1))
+        self.doc2 = Document.objects.create(checksum="B", title="B", created=date(2023, 1, 2))
+
+    def test_no_conflicts_when_empty(self) -> None:
+        """
+        GIVEN:
+            - expected_modified is empty
+        WHEN:
+            - check_document_conflicts is called
+        THEN:
+            - No conflicts are reported
+        """
+        conflicts = bulk_edit.check_document_conflicts(
+            [self.doc1.id, self.doc2.id],
+            {},
+        )
+        self.assertEqual(conflicts, {})
+
+    def test_no_conflict_when_timestamps_match(self) -> None:
+        """
+        GIVEN:
+            - expected_modified matches current modified timestamps
+        WHEN:
+            - check_document_conflicts is called
+        THEN:
+            - No conflicts are reported
+        """
+        self.doc1.refresh_from_db()
+        self.doc2.refresh_from_db()
+        expected = {
+            self.doc1.id: self.doc1.modified.isoformat(),
+            self.doc2.id: self.doc2.modified.isoformat(),
+        }
+        conflicts = bulk_edit.check_document_conflicts(
+            [self.doc1.id, self.doc2.id],
+            expected,
+        )
+        self.assertEqual(conflicts, {})
+
+    def test_conflict_detected_on_mismatch(self) -> None:
+        """
+        GIVEN:
+            - expected_modified has a stale timestamp for doc1
+        WHEN:
+            - check_document_conflicts is called
+        THEN:
+            - A conflict is reported for doc1 but not doc2
+        """
+        self.doc1.refresh_from_db()
+        self.doc2.refresh_from_db()
+        expected = {
+            self.doc1.id: "2020-01-01T00:00:00+00:00",
+            self.doc2.id: self.doc2.modified.isoformat(),
+        }
+        conflicts = bulk_edit.check_document_conflicts(
+            [self.doc1.id, self.doc2.id],
+            expected,
+        )
+        self.assertIn(self.doc1.id, conflicts)
+        self.assertNotIn(self.doc2.id, conflicts)
+        self.assertEqual(
+            conflicts[self.doc1.id]["expected_modified"],
+            "2020-01-01T00:00:00+00:00",
+        )
+
+    def test_conflict_error_exception(self) -> None:
+        """
+        GIVEN:
+            - A ConflictError is constructed
+        WHEN:
+            - Its attributes are inspected
+        THEN:
+            - conflicts dict and message are correct
+        """
+        conflicts = {1: {"expected_modified": "old", "actual_modified": "new"}}
+        err = bulk_edit.ConflictError(conflicts)
+        self.assertEqual(err.conflicts, conflicts)
+        self.assertIn("[1]", str(err))
+
+
+class TestTransactionMode(DirectoriesMixin, TestCase):
+    """Tests for optional transaction wrapping."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from datetime import date
+
+        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
+        self.async_task = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.c1 = Correspondent.objects.create(name="c1")
+        self.doc1 = Document.objects.create(
+            checksum="A", title="A", created=date(2023, 1, 1),
+        )
+        self.doc2 = Document.objects.create(
+            checksum="B", title="B", created=date(2023, 1, 2),
+        )
+
+    @mock.patch("documents.bulk_edit.run_bulk_edit")
+    def test_run_bulk_edit_with_transaction(self, mock_task) -> None:
+        """
+        GIVEN:
+            - use_transaction=True is passed to run_bulk_edit
+        WHEN:
+            - The task runs set_correspondent
+        THEN:
+            - set_correspondent is called inside a transaction.atomic() block
+        """
+        # Directly call the inner logic to verify transaction wrapping
+        from documents.models import BulkEditJob, BulkEditJobItem
+        from django.contrib.auth.models import User
+
+        user = User.objects.create(username="test_user")
+        job = BulkEditJob.objects.create(
+            owner=user,
+            method="set_correspondent",
+            total_documents=2,
+            use_transaction=True,
+        )
+        BulkEditJobItem.objects.bulk_create([
+            BulkEditJobItem(job=job, document_id=self.doc1.id),
+            BulkEditJobItem(job=job, document_id=self.doc2.id),
+        ])
+
+        result = bulk_edit.run_bulk_edit(
+            method_name="set_correspondent",
+            doc_ids=[self.doc1.id, self.doc2.id],
+            parameters={"correspondent": self.c1.id},
+            use_transaction=True,
+            job_id=job.pk,
+            user_id=user.pk,
+        )
+
+        self.assertEqual(result["result"], "OK")
+        self.assertEqual(result["job_id"], job.pk)
+
+        # Verify both documents were updated
+        self.doc1.refresh_from_db()
+        self.doc2.refresh_from_db()
+        self.assertEqual(self.doc1.correspondent, self.c1)
+        self.assertEqual(self.doc2.correspondent, self.c1)
+
+        # Verify job completed
+        job.refresh_from_db()
+        self.assertEqual(job.status, BulkEditJob.Status.COMPLETE)
+        self.assertEqual(job.completed_documents, 2)
+        self.assertEqual(job.failed_documents, 0)
+
+        # Verify all items are success
+        items = BulkEditJobItem.objects.filter(job=job)
+        self.assertEqual(items.count(), 2)
+        for item in items:
+            self.assertEqual(item.status, BulkEditJobItem.Status.SUCCESS)
+
+
+class TestProgressTracking(DirectoriesMixin, TestCase):
+    """Tests for BulkEditJob and BulkEditJobItem progress tracking."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from datetime import date
+
+        patcher = mock.patch("documents.bulk_edit.bulk_update_documents.apply_async")
+        self.async_task = patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.user = User.objects.create(username="progress_user")
+        self.c1 = Correspondent.objects.create(name="c1")
+        self.doc1 = Document.objects.create(
+            checksum="A", title="A", created=date(2023, 1, 1),
+        )
+        self.doc2 = Document.objects.create(
+            checksum="B", title="B", created=date(2023, 1, 2),
+        )
+        self.doc3 = Document.objects.create(
+            checksum="C", title="C", created=date(2023, 1, 3),
+        )
+
+    def test_job_creation_and_item_tracking(self) -> None:
+        """
+        GIVEN:
+            - A BulkEditJob with 3 items
+        WHEN:
+            - run_bulk_edit is called with job_id
+        THEN:
+            - All items are updated to SUCCESS
+            - Job status is COMPLETE
+        """
+        from documents.models import BulkEditJob, BulkEditJobItem
+
+        job = BulkEditJob.objects.create(
+            owner=self.user,
+            method="set_correspondent",
+            total_documents=3,
+        )
+        BulkEditJobItem.objects.bulk_create([
+            BulkEditJobItem(job=job, document_id=self.doc1.id),
+            BulkEditJobItem(job=job, document_id=self.doc2.id),
+            BulkEditJobItem(job=job, document_id=self.doc3.id),
+        ])
+
+        result = bulk_edit.run_bulk_edit(
+            method_name="set_correspondent",
+            doc_ids=[self.doc1.id, self.doc2.id, self.doc3.id],
+            parameters={"correspondent": self.c1.id},
+            job_id=job.pk,
+            user_id=self.user.pk,
+        )
+
+        self.assertEqual(result["result"], "OK")
+        job.refresh_from_db()
+        self.assertEqual(job.status, BulkEditJob.Status.COMPLETE)
+        self.assertEqual(job.completed_documents, 3)
+        self.assertEqual(BulkEditJobItem.objects.filter(job=job, status="success").count(), 3)
+
+    def test_job_failure_marks_items(self) -> None:
+        """
+        GIVEN:
+            - A BulkEditJob exists
+        WHEN:
+            - The underlying method raises an exception
+        THEN:
+            - All pending items are marked FAILURE
+            - Job status is FAILED
+        """
+        from documents.models import BulkEditJob, BulkEditJobItem
+
+        job = BulkEditJob.objects.create(
+            owner=self.user,
+            method="set_correspondent",
+            total_documents=1,
+        )
+        BulkEditJobItem.objects.create(job=job, document_id=self.doc1.id)
+
+        with mock.patch(
+            "documents.bulk_edit.set_correspondent",
+            side_effect=RuntimeError("db error"),
+        ):
+            with self.assertRaises(RuntimeError):
+                bulk_edit.run_bulk_edit(
+                    method_name="set_correspondent",
+                    doc_ids=[self.doc1.id],
+                    parameters={"correspondent": self.c1.id},
+                    job_id=job.pk,
+                    user_id=self.user.pk,
+                )
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, BulkEditJob.Status.FAILED)
+        item = BulkEditJobItem.objects.get(job=job, document_id=self.doc1.id)
+        self.assertEqual(item.status, BulkEditJobItem.Status.FAILURE)
+        self.assertIn("db error", item.error_message)
+
+    def test_conflict_marks_items_as_conflict(self) -> None:
+        """
+        GIVEN:
+            - A BulkEditJob with expected_modified that doesn't match
+        WHEN:
+            - run_bulk_edit is called
+        THEN:
+            - Conflicting items are marked CONFLICT
+            - Job is FAILED
+            - ConflictError is raised
+        """
+        from documents.models import BulkEditJob, BulkEditJobItem
+
+        job = BulkEditJob.objects.create(
+            owner=self.user,
+            method="set_correspondent",
+            total_documents=1,
+        )
+        BulkEditJobItem.objects.create(job=job, document_id=self.doc1.id)
+
+        with self.assertRaises(bulk_edit.ConflictError):
+            bulk_edit.run_bulk_edit(
+                method_name="set_correspondent",
+                doc_ids=[self.doc1.id],
+                parameters={"correspondent": self.c1.id},
+                expected_modified={self.doc1.id: "2020-01-01T00:00:00+00:00"},
+                job_id=job.pk,
+                user_id=self.user.pk,
+            )
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, BulkEditJob.Status.FAILED)
+        item = BulkEditJobItem.objects.get(job=job, document_id=self.doc1.id)
+        self.assertEqual(item.status, BulkEditJobItem.Status.CONFLICT)
+
+    def test_transaction_rollback_on_failure(self) -> None:
+        """
+        GIVEN:
+            - use_transaction=True
+        WHEN:
+            - The underlying method raises after partially modifying docs
+        THEN:
+            - All changes are rolled back (transaction.atomic)
+        """
+        from documents.models import BulkEditJob, BulkEditJobItem
+
+        job = BulkEditJob.objects.create(
+            owner=self.user,
+            method="set_correspondent",
+            total_documents=2,
+            use_transaction=True,
+        )
+        BulkEditJobItem.objects.bulk_create([
+            BulkEditJobItem(job=job, document_id=self.doc1.id),
+            BulkEditJobItem(job=job, document_id=self.doc2.id),
+        ])
+
+        def failing_set_correspondent(doc_ids, **kwargs):
+            # Simulate partial work then failure
+            Document.objects.filter(id=doc_ids[0]).update(correspondent=self.c1)
+            raise RuntimeError("simulated failure")
+
+        with mock.patch(
+            "documents.bulk_edit.set_correspondent",
+            side_effect=failing_set_correspondent,
+        ):
+            with self.assertRaises(RuntimeError):
+                bulk_edit.run_bulk_edit(
+                    method_name="set_correspondent",
+                    doc_ids=[self.doc1.id, self.doc2.id],
+                    parameters={"correspondent": self.c1.id},
+                    use_transaction=True,
+                    job_id=job.pk,
+                    user_id=self.user.pk,
+                )
+
+        # The partial update should have been rolled back
+        self.doc1.refresh_from_db()
+        self.assertIsNone(self.doc1.correspondent)

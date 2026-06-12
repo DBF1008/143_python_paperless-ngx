@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
 from typing import Literal
 from typing import NamedTuple
 
@@ -18,6 +22,8 @@ from django.utils import timezone
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
 from documents.data_models import DocumentSource
+from documents.models import BulkEditJob
+from documents.models import BulkEditJobItem
 from documents.models import Correspondent
 from documents.models import CustomField
 from documents.models import CustomFieldInstance
@@ -52,6 +58,272 @@ class SourceModeChoices:
 class ResolvedDocPair(NamedTuple):
     root_doc: Document
     source_doc: Document
+
+
+class ConflictError(Exception):
+    """
+    Raised when one or more documents have been modified since the caller
+    last read them, indicating a potential concurrent-edit conflict.
+
+    Attributes:
+        conflicts: mapping of document_id -> {
+            "expected_modified": the ISO timestamp the caller supplied,
+            "actual_modified": the current modified timestamp in the database,
+        }
+    """
+
+    def __init__(self, conflicts: dict[int, dict[str, str]]) -> None:
+        self.conflicts = conflicts
+        ids = list(conflicts.keys())
+        super().__init__(
+            f"Concurrent modification detected for document(s) {ids}. "
+            "Reload and retry.",
+        )
+
+
+def check_document_conflicts(
+    doc_ids: list[int],
+    expected_modified: dict[int, str],
+) -> dict[int, dict[str, str]]:
+    """
+    Compare each document's current ``modified`` timestamp against the
+    caller-supplied *expected_modified* mapping.
+
+    Parameters
+    ----------
+    doc_ids:
+        The document IDs that will be mutated.
+    expected_modified:
+        Mapping of ``{doc_id: ISO-8601 timestamp}`` representing the last
+        known modification time as seen by the caller.
+
+    Returns
+    -------
+    dict
+        Mapping of conflicting ``doc_id`` ->
+        ``{"expected_modified": ..., "actual_modified": ...}``.
+        An empty dict means no conflicts.
+    """
+    if not expected_modified:
+        return {}
+
+    docs = Document.objects.filter(id__in=doc_ids).values("id", "modified")
+    conflicts: dict[int, dict[str, str]] = {}
+
+    for doc in docs:
+        doc_id = doc["id"]
+        if doc_id not in expected_modified:
+            continue
+        expected = expected_modified[doc_id]
+        # Normalise both sides to comparable strings
+        actual = doc["modified"]
+        if isinstance(actual, datetime):
+            actual_str = actual.isoformat()
+        else:
+            actual_str = str(actual)
+        expected_str = (
+            expected.isoformat() if isinstance(expected, datetime) else str(expected)
+        )
+        if actual_str != expected_str:
+            conflicts[doc_id] = {
+                "expected_modified": expected_str,
+                "actual_modified": actual_str,
+            }
+
+    return conflicts
+
+
+def _update_job_item(
+    job: BulkEditJob | None,
+    doc_id: int,
+    status: str,
+    error_message: str = "",
+) -> None:
+    """Helper to update a single BulkEditJobItem without raising."""
+    if job is None:
+        return
+    try:
+        BulkEditJobItem.objects.filter(job=job, document_id=doc_id).update(
+            status=status,
+            error_message=error_message,
+            date_done=timezone.now(),
+        )
+    except Exception:
+        logger.exception(
+            f"Failed to update job item for job={job.pk} doc={doc_id}",
+        )
+
+
+def _finalize_job(job: BulkEditJob | None) -> None:
+    """Mark the job as complete/failed and set date_done."""
+    if job is None:
+        return
+    try:
+        job.refresh_from_db()
+        if job.failed_documents > 0:
+            job.status = BulkEditJob.Status.FAILED
+        else:
+            job.status = BulkEditJob.Status.COMPLETE
+        job.date_done = timezone.now()
+        job.save(
+            update_fields=["status", "date_done", "completed_documents", "failed_documents"],
+        )
+    except Exception:
+        logger.exception(f"Failed to finalize job {job.pk}")
+
+
+@shared_task(bind=True)
+def run_bulk_edit(
+    self,
+    method_name: str,
+    doc_ids: list[int],
+    parameters: dict[str, Any],
+    *,
+    use_transaction: bool = False,
+    expected_modified: dict[int, str] | None = None,
+    job_id: int | None = None,
+    user_id: int | None = None,
+) -> dict[str, Any]:
+    """
+    Celery task that orchestrates a bulk edit operation with optional:
+    - **Transaction mode**: wraps the entire operation in ``transaction.atomic()``
+      so any failure rolls back all changes.
+    - **Progress tracking**: creates/updates ``BulkEditJob`` and
+      ``BulkEditJobItem`` rows so callers can poll for fine-grained progress.
+    - **Conflict detection**: compares each document's ``modified`` timestamp
+      against *expected_modified* before applying changes; raises
+      ``ConflictError`` if any document has been concurrently modified.
+
+    Parameters
+    ----------
+    method_name:
+        Name of the bulk_edit function to call (e.g. ``"set_correspondent"``).
+    doc_ids:
+        List of document IDs to operate on.
+    parameters:
+        Keyword arguments forwarded to the bulk_edit function.
+    use_transaction:
+        If ``True``, the entire batch runs inside a single database
+        transaction.  A failure on any document rolls back all changes.
+    expected_modified:
+        Optional mapping of ``{doc_id: ISO-8601 timestamp}`` for optimistic
+        locking.  If any document's current ``modified`` differs from the
+        supplied value, the operation aborts with ``ConflictError``.
+    job_id:
+        Optional ``BulkEditJob`` primary key.  If supplied, per-document
+        progress is written to ``BulkEditJobItem`` rows.
+    user_id:
+        Optional user ID to set as the job owner.
+
+    Returns
+    -------
+    dict
+        ``{"result": "OK", "job_id": <int|None>}`` on success.
+
+    Raises
+    ------
+    ConflictError
+        If conflict detection finds concurrently modified documents.
+    """
+    from documents import bulk_edit as _be
+
+    # Resolve the target function
+    method_fn: Callable[..., Literal["OK"]] = getattr(_be, method_name, None)
+    if method_fn is None:
+        raise ValueError(f"Unknown bulk_edit method: {method_name}")
+
+    job: BulkEditJob | None = None
+    if job_id is not None:
+        try:
+            job = BulkEditJob.objects.get(pk=job_id)
+            job.status = BulkEditJob.Status.STARTED
+            job.save(update_fields=["status"])
+        except BulkEditJob.DoesNotExist:
+            logger.warning(f"BulkEditJob {job_id} not found, proceeding without tracking")
+
+    # -- Conflict detection ------------------------------------------------
+    if expected_modified:
+        conflicts = check_document_conflicts(doc_ids, expected_modified)
+        if conflicts:
+            if job is not None:
+                for doc_id in conflicts:
+                    _update_job_item(
+                        job,
+                        doc_id,
+                        BulkEditJobItem.Status.CONFLICT,
+                        error_message="Document was modified concurrently",
+                    )
+                job.failed_documents = len(conflicts)
+                job.status = BulkEditJob.Status.FAILED
+                job.date_done = timezone.now()
+                job.error_message = (
+                    f"Conflict detected for {len(conflicts)} document(s)"
+                )
+                job.save()
+            raise ConflictError(conflicts)
+
+    # -- Execute with optional transaction wrapping -------------------------
+    completed = 0
+    failed = 0
+
+    def _do_work() -> Literal["OK"]:
+        nonlocal completed, failed
+        if job is not None:
+            # Per-document progress tracking: execute the function once for
+            # the whole batch (existing functions are batch-oriented), then
+            # update all items to success/failure.
+            try:
+                result = method_fn(doc_ids, **parameters)
+                now = timezone.now()
+                BulkEditJobItem.objects.filter(
+                    job=job,
+                    status=BulkEditJobItem.Status.PENDING,
+                ).update(
+                    status=BulkEditJobItem.Status.SUCCESS,
+                    date_done=now,
+                )
+                completed = len(doc_ids)
+                return result
+            except Exception as exc:
+                now = timezone.now()
+                BulkEditJobItem.objects.filter(
+                    job=job,
+                    status=BulkEditJobItem.Status.PENDING,
+                ).update(
+                    status=BulkEditJobItem.Status.FAILURE,
+                    error_message=str(exc)[:1000],
+                    date_done=now,
+                )
+                failed = len(doc_ids)
+                raise
+        else:
+            return method_fn(doc_ids, **parameters)
+
+    try:
+        if use_transaction:
+            with transaction.atomic():
+                result = _do_work()
+        else:
+            result = _do_work()
+
+        if job is not None:
+            job.completed_documents = completed
+            job.failed_documents = failed
+            _finalize_job(job)
+
+        return {"result": result, "job_id": job_id}
+
+    except ConflictError:
+        # Already handled above, re-raise
+        raise
+    except Exception as exc:
+        if job is not None:
+            job.failed_documents = failed or len(doc_ids)
+            job.error_message = f"{exc}\n{traceback.format_exc()}"[:2000]
+            job.status = BulkEditJob.Status.FAILED
+            job.date_done = timezone.now()
+            job.save()
+        raise
 
 
 @shared_task(bind=True)

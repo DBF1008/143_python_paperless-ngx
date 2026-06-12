@@ -16,6 +16,7 @@ from drf_spectacular.views import SpectacularSwaggerView
 from rest_framework.routers import DefaultRouter
 
 from documents.views import BulkDownloadView
+from documents.views import BulkEditJobStatusView
 from documents.views import BulkEditObjectsView
 from documents.views import BulkEditView
 from documents.views import ChatStreamingView
@@ -151,6 +152,11 @@ urlpatterns = [
                                 "^bulk_edit/",
                                 BulkEditView.as_view(),
                                 name="bulk_edit",
+                            ),
+                            re_path(
+                                "^bulk_edit/job/(?P<pk>[0-9]+)/$",
+                                BulkEditJobStatusView.as_view(),
+                                name="bulk_edit_job_status",
                             ),
                             re_path(
                                 "^delete/",

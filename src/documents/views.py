@@ -154,6 +154,8 @@ from documents.models import Document
 from documents.models import DocumentType
 from documents.models import Note
 from documents.models import PaperlessTask
+from documents.models import BulkEditJob
+from documents.models import BulkEditJobItem
 from documents.models import SavedView
 from documents.models import ShareLink
 from documents.models import ShareLinkBundle
@@ -180,6 +182,7 @@ from documents.schema import generate_object_with_permissions_schema
 from documents.search import SearchHit
 from documents.serialisers import AcknowledgeTasksViewSerializer
 from documents.serialisers import BulkDownloadSerializer
+from documents.serialisers import BulkEditJobStatusSerializer
 from documents.serialisers import BulkEditObjectsSerializer
 from documents.serialisers import BulkEditSerializer
 from documents.serialisers import CorrespondentSerializer
@@ -2768,7 +2771,16 @@ class DocumentOperationPermissionMixin(PassUserMixin, DocumentSelectionMixin):
         parameters = {
             k: v
             for k, v in validated_data.items()
-            if k not in {"documents", "all", "filters", "from_webui"}
+            if k
+            not in {
+                "documents",
+                "all",
+                "filters",
+                "from_webui",
+                "use_transaction",
+                "expected_modified",
+                "track_progress",
+            }
         }
         user = self.request.user
         from_webui = validated_data.get("from_webui", False)
@@ -2793,6 +2805,14 @@ class DocumentOperationPermissionMixin(PassUserMixin, DocumentSelectionMixin):
         try:
             result = method(documents, **parameters)
             return Response({"result": result})
+        except bulk_edit.ConflictError as e:
+            return Response(
+                {
+                    "error": "Concurrent modification detected",
+                    "conflicts": {str(k): v for k, v in e.conflicts.items()},
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         except Exception as e:
             logger.warning(f"An error occurred performing {operation_label}: {e!s}")
             return HttpResponseBadRequest(
@@ -2865,6 +2885,10 @@ class BulkEditView(DocumentOperationPermissionMixin):
         method = serializer.validated_data.get("method")
         parameters = serializer.validated_data.get("parameters")
         from_webui = serializer.validated_data.get("from_webui", False)
+        use_transaction = serializer.validated_data.get("use_transaction", False)
+        expected_modified = serializer.validated_data.get("expected_modified", {})
+        track_progress = serializer.validated_data.get("track_progress", False)
+
         documents = self._resolve_document_ids(
             user=user,
             validated_data=serializer.validated_data,
@@ -2885,6 +2909,46 @@ class BulkEditView(DocumentOperationPermissionMixin):
         ):
             return HttpResponseForbidden("Insufficient permissions")
 
+        # -- Progress tracking: create BulkEditJob + items -------------------
+        job: BulkEditJob | None = None
+        if track_progress:
+            job = BulkEditJob.objects.create(
+                owner=user,
+                status=BulkEditJob.Status.PENDING,
+                method=method.__name__,
+                total_documents=len(documents),
+                use_transaction=use_transaction,
+            )
+            BulkEditJobItem.objects.bulk_create(
+                [
+                    BulkEditJobItem(job=job, document_id=doc_id)
+                    for doc_id in documents
+                ],
+            )
+
+        # -- Async dispatch when progress tracking is enabled ----------------
+        if track_progress and job is not None:
+            bulk_edit.run_bulk_edit.apply_async(
+                kwargs={
+                    "method_name": method.__name__,
+                    "doc_ids": documents,
+                    "parameters": parameters,
+                    "use_transaction": use_transaction,
+                    "expected_modified": expected_modified,
+                    "job_id": job.pk,
+                    "user_id": user.pk,
+                },
+            )
+            return Response(
+                {
+                    "result": "OK",
+                    "job_id": job.pk,
+                    "status_url": f"/api/bulk_edit/job/{job.pk}/",
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        # -- Synchronous execution (with optional transaction / conflict) ----
         try:
             modified_field = self.MODIFIED_FIELD_BY_METHOD.get(method.__name__, None)
             if settings.AUDIT_LOG_ENABLED and modified_field:
@@ -2902,7 +2966,30 @@ class BulkEditView(DocumentOperationPermissionMixin):
                     )
                 }
 
-            result = method(documents, **parameters)
+            # Conflict detection (synchronous path)
+            if expected_modified:
+                conflicts = bulk_edit.check_document_conflicts(
+                    documents,
+                    expected_modified,
+                )
+                if conflicts:
+                    return Response(
+                        {
+                            "error": "Concurrent modification detected",
+                            "conflicts": {
+                                str(k): v for k, v in conflicts.items()
+                            },
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+            if use_transaction:
+                from django.db import transaction as db_transaction
+
+                with db_transaction.atomic():
+                    result = method(documents, **parameters)
+            else:
+                result = method(documents, **parameters)
 
             if settings.AUDIT_LOG_ENABLED and modified_field:
                 new_documents = Document.objects.filter(pk__in=documents)
@@ -2933,11 +3020,44 @@ class BulkEditView(DocumentOperationPermissionMixin):
                     )
 
             return Response({"result": result})
+        except bulk_edit.ConflictError as e:
+            return Response(
+                {
+                    "error": "Concurrent modification detected",
+                    "conflicts": {str(k): v for k, v in e.conflicts.items()},
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         except Exception as e:
             logger.warning(f"An error occurred performing bulk edit: {e!s}")
             return HttpResponseBadRequest(
                 "Error performing bulk edit, check logs for more detail.",
             )
+
+
+@extend_schema_view(
+    get=extend_schema(
+        operation_id="bulk_edit_job_status",
+        description="Retrieve the status and per-document progress of a bulk edit job.",
+        responses={
+            200: BulkEditJobStatusSerializer,
+            404: None,
+        },
+    ),
+)
+class BulkEditJobStatusView(PassUserMixin):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, *args, **kwargs):
+        job_id = kwargs.get("pk")
+        job = get_object_or_404(BulkEditJob, pk=job_id)
+
+        # Only the job owner (or superuser) may view the status
+        if job.owner is not None and job.owner != request.user and not request.user.is_superuser:
+            return HttpResponseForbidden("Insufficient permissions")
+
+        serializer = BulkEditJobStatusSerializer(job)
+        return Response(serializer.data)
 
 
 @extend_schema_view(
