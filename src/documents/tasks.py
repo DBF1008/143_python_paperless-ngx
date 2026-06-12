@@ -279,11 +279,26 @@ def consume_file(
 
 
 @shared_task
-def sanity_check(*, raise_on_error: bool = True) -> str:
-    messages = sanity_checker.check_sanity()
+def sanity_check(
+    *,
+    raise_on_error: bool = True,
+    delete_orphans: bool = False,
+) -> str:
+    messages = sanity_checker.check_sanity(delete_orphans=delete_orphans)
     messages.log_messages()
 
-    if not messages.has_error and not messages.has_warning and not messages.has_info:
+    orphan_summary = getattr(messages, "orphan_summary", None)
+
+    if (
+        not messages.has_error
+        and not messages.has_warning
+        and not messages.has_info
+    ):
+        if orphan_summary and orphan_summary.cleaned_up:
+            return (
+                f"No issues detected. Cleaned up {orphan_summary.total_count} "
+                f"orphaned file(s)."
+            )
         return "No issues detected."
 
     parts: list[str] = []
@@ -295,6 +310,13 @@ def sanity_check(*, raise_on_error: bool = True) -> str:
         parts.append(f"{messages.document_info_count} document(s) with infos")
     if messages.global_warning_count:
         parts.append(f"{messages.global_warning_count} global warning(s)")
+    if orphan_summary and orphan_summary.total_count > 0:
+        if orphan_summary.cleaned_up:
+            parts.append(
+                f"{orphan_summary.total_count} orphaned file(s) cleaned up",
+            )
+        else:
+            parts.append(f"{orphan_summary.total_count} orphaned file(s)")
 
     summary = ", ".join(parts) + " found."
 

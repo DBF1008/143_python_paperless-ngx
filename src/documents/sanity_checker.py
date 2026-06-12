@@ -2,22 +2,44 @@
 Sanity checker for the Paperless-ngx document archive.
 
 Verifies that all documents have valid files, correct checksums,
-and consistent metadata. Reports orphaned files in the media directory.
+and consistent metadata. Reports and optionally cleans up orphaned
+files in the media directory.
 
-Progress display is the caller's responsibility -- pass an ``iter_wrapper``
-to wrap the document queryset (e.g., with a progress bar). The default
-is an identity function that adds no overhead.
+Progress display is the caller's responsibility:
+
+* Pass an ``iter_wrapper`` to wrap the document queryset (e.g., with
+  a progress bar).  The default is an identity function that adds no
+  overhead.
+* Pass a ``progress_callback`` to receive coarse-grained phase
+  notifications (e.g., ``"scan_start"``, ``"documents_complete"``).
+
+Concurrency protection
+----------------------
+The checker acquires :data:`settings.MEDIA_LOCK` while scanning the
+media directory to avoid false-positive orphan reports caused by
+concurrent ``consume_file`` writes.  Orphan candidates are re-verified
+after document processing using an mtime-based filter under a second
+lock acquisition.
 """
 
+from __future__ import annotations
+
 import logging
+import time
 from collections import defaultdict
+from collections.abc import Callable
 from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Final
 from typing import TypedDict
 
 from django.conf import settings
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
 from documents.models import Document
 from documents.utils import IterWrapper
@@ -26,6 +48,341 @@ from documents.utils import identity
 from paperless.config import GeneralConfig
 
 logger = logging.getLogger("paperless.sanity_checker")
+
+# Type alias for progress phase callbacks.
+# The callback receives a short phase identifier string.
+ProgressCallback = Callable[[str], None]
+
+# Default timeout (seconds) when waiting for the media lock.
+_LOCK_TIMEOUT_SECONDS: Final[float] = 30.0
+_MAX_LOCK_ATTEMPTS: Final[int] = 2
+
+
+# ---------------------------------------------------------------------------
+# Orphan file analysis data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class OrphanFileInfo:
+    """Metadata about a single orphaned file found in the media directory."""
+
+    path: Path
+    category: str  # "originals", "archive", "thumbnails", or "other"
+    size: int
+
+
+@dataclass
+class OrphanSummary:
+    """Aggregated analysis of all orphaned files detected during a check."""
+
+    orphans: list[OrphanFileInfo] = field(default_factory=list)
+    by_category: dict[str, dict[str, int]] = field(default_factory=dict)
+    total_count: int = 0
+    total_size: int = 0
+    cleaned_up: bool = False
+    freed_bytes: int = 0
+
+    @property
+    def has_orphans(self) -> bool:
+        return self.total_count > 0
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — filesystem scanning
+# ---------------------------------------------------------------------------
+
+
+def _build_present_files(lock: FileLock | None = None) -> set[Path]:
+    """Collect all files in MEDIA_ROOT, excluding directories and ignorable files.
+
+    When *lock* is provided and is currently held, the scan runs under
+    the lock to avoid race conditions with concurrent file writes (e.g.,
+    from ``consume_file``).
+
+    Excludes:
+    - Directories
+    - Filenames listed in ``settings.IGNORABLE_FILES``
+    - The ``MEDIA_LOCK`` file itself
+    - The custom ``app_logo`` file
+    - Files under ``SHARE_LINK_BUNDLE_DIR``
+    """
+    if lock is not None and lock.is_locked:
+        with lock:
+            return _scan_media_root()
+    return _scan_media_root()
+
+
+def _scan_media_root() -> set[Path]:
+    """Perform the actual glob of MEDIA_ROOT, applying all exclusion filters."""
+    present_files = {
+        x.resolve()
+        for x in Path(settings.MEDIA_ROOT).glob("**/*")
+        if not x.is_dir() and x.name not in settings.IGNORABLE_FILES
+    }
+
+    # Exclude the lock file itself
+    lockfile = Path(settings.MEDIA_LOCK).resolve()
+    present_files.discard(lockfile)
+
+    # Exclude share link bundle files
+    bundle_dir = Path(settings.SHARE_LINK_BUNDLE_DIR).resolve()
+    present_files = {f for f in present_files if not f.is_relative_to(bundle_dir)}
+
+    # Exclude custom app logo
+    general_config = GeneralConfig()
+    app_logo = general_config.app_logo or settings.APP_LOGO
+    if app_logo:
+        logo_file = Path(settings.MEDIA_ROOT / Path(app_logo.lstrip("/"))).resolve()
+        present_files.discard(logo_file)
+
+    return present_files
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — orphan analysis
+# ---------------------------------------------------------------------------
+
+
+def _classify_orphan(file_path: Path) -> str:
+    """Determine which media sub-directory an orphan file belongs to."""
+    resolved = file_path.resolve()
+    originals = Path(settings.ORIGINALS_DIR).resolve()
+    archive = Path(settings.ARCHIVE_DIR).resolve()
+    thumbnails = Path(settings.THUMBNAIL_DIR).resolve()
+
+    if resolved.is_relative_to(originals):
+        return "originals"
+    if resolved.is_relative_to(archive):
+        return "archive"
+    if resolved.is_relative_to(thumbnails):
+        return "thumbnails"
+    return "other"
+
+
+def _build_orphan_summary(orphan_files: set[Path]) -> OrphanSummary:
+    """Build a categorized summary of orphaned files with sizes."""
+    orphans: list[OrphanFileInfo] = []
+    by_category: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"count": 0, "size": 0},
+    )
+
+    for file_path in orphan_files:
+        resolved = file_path.resolve()
+        category = _classify_orphan(resolved)
+        try:
+            size = resolved.stat().st_size
+        except OSError:
+            size = 0
+
+        info = OrphanFileInfo(path=resolved, category=category, size=size)
+        orphans.append(info)
+        by_category[category]["count"] += 1
+        by_category[category]["size"] += size
+
+    total_count = len(orphans)
+    total_size = sum(o.size for o in orphans)
+
+    if total_count > 0:
+        logger.info(
+            "Found %d orphaned file(s) totaling %s",
+            total_count,
+            _format_size(total_size),
+        )
+
+    return OrphanSummary(
+        orphans=orphans,
+        by_category=dict(by_category),
+        total_count=total_count,
+        total_size=total_size,
+    )
+
+
+def _verify_orphans(
+    orphan_candidates: set[Path],
+    scan_start: float,
+    lock_held: bool,
+) -> set[Path]:
+    """Re-verify orphan candidates to filter false positives.
+
+    Acquires MEDIA_LOCK and re-checks each candidate:
+    - File must still exist on disk
+    - If the lock is held, the file's mtime must predate the scan start
+      (files created by ``consume_file`` after the scan began are skipped)
+
+    This protects against race conditions where ``consume_file`` writes
+    a new file to MEDIA_ROOT between the initial scan and orphan reporting.
+    """
+    if not orphan_candidates:
+        return set()
+
+    lock_path = Path(settings.MEDIA_LOCK)
+    lock = FileLock(lock_path)
+
+    confirmed: set[Path] = set()
+
+    try:
+        lock.acquire(timeout=_LOCK_TIMEOUT_SECONDS)
+        lock_acquired = True
+    except FileLockTimeout:
+        logger.warning(
+            "Could not acquire media lock for orphan re-verification; "
+            "falling back to existence-only check.",
+        )
+        lock_acquired = False
+
+    try:
+        for candidate in orphan_candidates:
+            if not candidate.is_file():
+                continue
+            if lock_acquired and lock_held:
+                try:
+                    mtime = candidate.stat().st_mtime
+                    if mtime >= scan_start:
+                        logger.debug(
+                            "Skipping recently modified file during orphan "
+                            "re-verification: %s (mtime=%.2f, scan_start=%.2f)",
+                            candidate,
+                            mtime,
+                            scan_start,
+                        )
+                        continue
+                except OSError:
+                    continue
+            confirmed.add(candidate)
+    finally:
+        if lock_acquired:
+            lock.release()
+
+    return confirmed
+
+
+# ---------------------------------------------------------------------------
+# Orphan cleanup
+# ---------------------------------------------------------------------------
+
+
+def handle_orphan_cleanup(orphan_summary: OrphanSummary) -> OrphanSummary:
+    """Safely remove orphaned files from the media directory.
+
+    Acquires MEDIA_LOCK before deleting to prevent conflicts with
+    concurrent ``consume_file`` operations.  Files that no longer exist
+    or cannot be removed are silently skipped (with a warning log).
+
+    Returns the updated *orphan_summary* with ``cleaned_up=True`` and
+    ``freed_bytes`` reflecting the actual bytes reclaimed.
+    """
+    if not orphan_summary.has_orphans:
+        return orphan_summary
+
+    lock = FileLock(Path(settings.MEDIA_LOCK))
+    freed_bytes = 0
+    removed_count = 0
+
+    try:
+        lock.acquire(timeout=_LOCK_TIMEOUT_SECONDS)
+    except FileLockTimeout:
+        logger.warning(
+            "Could not acquire media lock for orphan cleanup. "
+            "Skipping cleanup to avoid conflicts with ongoing operations.",
+        )
+        return orphan_summary
+
+    try:
+        for orphan in orphan_summary.orphans:
+            try:
+                if orphan.path.is_file():
+                    orphan.path.unlink()
+                    freed_bytes += orphan.size
+                    removed_count += 1
+                    logger.debug("Removed orphaned file: %s", orphan.path)
+            except OSError as e:
+                logger.warning(
+                    "Failed to remove orphaned file %s: %s",
+                    orphan.path,
+                    e,
+                )
+    finally:
+        lock.release()
+
+    logger.info(
+        "Cleaned up %d orphaned file(s), freed %s.",
+        removed_count,
+        _format_size(freed_bytes),
+    )
+
+    orphan_summary.cleaned_up = True
+    orphan_summary.freed_bytes = freed_bytes
+    return orphan_summary
+
+
+# ---------------------------------------------------------------------------
+# Lock acquisition helper
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _acquire_sanity_check_lock(
+    lock_path: Path,
+    timeout: float = _LOCK_TIMEOUT_SECONDS,
+    max_attempts: int = _MAX_LOCK_ATTEMPTS,
+):
+    """Context manager that acquires MEDIA_LOCK for the sanity checker.
+
+    Attempts up to *max_attempts* times with *timeout* seconds each.
+    If the lock cannot be acquired after all attempts, yields ``None``
+    and logs a warning — the checker proceeds without protection,
+    relying on orphan re-verification to mitigate false positives.
+    """
+    lock = FileLock(lock_path)
+    acquired = False
+
+    for attempt in range(max_attempts):
+        try:
+            lock.acquire(timeout=timeout)
+            acquired = True
+            break
+        except FileLockTimeout:
+            if attempt < max_attempts - 1:
+                logger.warning(
+                    "Media lock busy (attempt %d/%d), retrying...",
+                    attempt + 1,
+                    max_attempts,
+                )
+            else:
+                logger.warning(
+                    "Could not acquire media lock after %d attempts. "
+                    "Proceeding without lock protection; orphan results "
+                    "may include false positives from concurrent operations.",
+                    max_attempts,
+                )
+
+    try:
+        yield lock if acquired else None
+    finally:
+        if acquired:
+            lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — formatting
+# ---------------------------------------------------------------------------
+
+
+def _format_size(size_bytes: int) -> str:
+    """Return a human-readable file size string."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers — message collection
+# ---------------------------------------------------------------------------
 
 
 class MessageEntry(TypedDict):
@@ -148,28 +505,8 @@ class SanityCheckFailedException(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Internal helpers — per-document checks
 # ---------------------------------------------------------------------------
-
-
-def _build_present_files() -> set[Path]:
-    """Collect all files in MEDIA_ROOT, excluding directories and ignorable files."""
-    present_files = {
-        x.resolve()
-        for x in Path(settings.MEDIA_ROOT).glob("**/*")
-        if not x.is_dir() and x.name not in settings.IGNORABLE_FILES
-    }
-
-    lockfile = Path(settings.MEDIA_LOCK).resolve()
-    present_files.discard(lockfile)
-
-    general_config = GeneralConfig()
-    app_logo = general_config.app_logo or settings.APP_LOGO
-    if app_logo:
-        logo_file = Path(settings.MEDIA_ROOT / Path(app_logo.lstrip("/"))).resolve()
-        present_files.discard(logo_file)
-
-    return present_files
 
 
 def _check_thumbnail(
@@ -284,19 +621,45 @@ def _check_document(
 def check_sanity(
     *,
     iter_wrapper: IterWrapper[Document] = identity,
+    progress_callback: ProgressCallback | None = None,
+    delete_orphans: bool = False,
 ) -> SanityCheckMessages:
     """Run a full sanity check on the document archive.
+
+    Acquires the media lock while scanning the filesystem to prevent
+    false-positive orphan reports from concurrent write operations.
+    Orphan candidates are re-verified after document processing.
 
     Args:
         iter_wrapper: A callable that wraps the document iterable, e.g.,
             for progress bar display. Defaults to identity (no wrapping).
+        progress_callback: Optional callback receiving a phase string
+            (e.g., ``"scan_start"``, ``"documents_complete"``) for
+            coarse-grained progress reporting.
+        delete_orphans: If ``True``, remove detected orphan files after
+            analysis (with lock protection).
 
     Returns:
         A SanityCheckMessages instance containing all detected issues.
+        The ``orphan_summary`` attribute holds the orphan analysis.
     """
-    messages = SanityCheckMessages()
-    present_files = _build_present_files()
+    scan_start = time.monotonic()
 
+    def _notify(phase: str) -> None:
+        if progress_callback:
+            progress_callback(phase)
+
+    messages = SanityCheckMessages()
+
+    # Acquire media lock and scan filesystem
+    lock_path = Path(settings.MEDIA_LOCK)
+    with _acquire_sanity_check_lock(lock_path) as lock:
+        _notify("scan_start")
+        present_files = _build_present_files(lock)
+        _notify("scan_complete")
+
+    # Check each document (lock released — consumption can proceed)
+    _notify("documents_start")
     documents = Document.global_objects.only(
         "pk",
         "filename",
@@ -308,8 +671,35 @@ def check_sanity(
     ).iterator(chunk_size=500)
     for doc in iter_wrapper(documents):
         _check_document(doc, messages, present_files)
+    _notify("documents_complete")
 
-    for extra_file in present_files:
-        messages.warning(None, f"Orphaned file in media dir: {extra_file}")
+    # Orphan analysis with re-verification
+    _notify("orphans_start")
+    confirmed_orphans = _verify_orphans(
+        present_files,
+        scan_start=scan_start,
+        lock_held=True,
+    )
+    orphan_summary = _build_orphan_summary(confirmed_orphans)
+    messages.orphan_summary = orphan_summary
+
+    # Report orphans as warnings
+    for orphan in orphan_summary.orphans:
+        try:
+            rel_path = orphan.path.relative_to(settings.MEDIA_ROOT)
+        except ValueError:
+            rel_path = orphan.path
+        messages.warning(
+            None,
+            f"Orphaned file in media dir: {rel_path} "
+            f"({orphan.category}, {_format_size(orphan.size)})",
+        )
+    _notify("orphans_complete")
+
+    # Optional cleanup
+    if delete_orphans and orphan_summary.has_orphans:
+        _notify("cleanup_start")
+        handle_orphan_cleanup(orphan_summary)
+        _notify("cleanup_complete")
 
     return messages

@@ -7,12 +7,20 @@ orphan detection, and the iter_wrapper contract.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
+from documents.sanity_checker import OrphanFileInfo
+from documents.sanity_checker import OrphanSummary
+from documents.sanity_checker import _build_orphan_summary
+from documents.sanity_checker import _classify_orphan
+from documents.sanity_checker import _format_size
+from documents.sanity_checker import _verify_orphans
 from documents.sanity_checker import check_sanity
+from documents.sanity_checker import handle_orphan_cleanup
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -208,6 +216,46 @@ class TestCheckSanityOrphans:
         messages = check_sanity()
         assert not messages.has_warning
 
+    @pytest.mark.usefixtures("_media_settings")
+    def test_share_link_bundle_not_flagged(
+        self,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        """Files in SHARE_LINK_BUNDLE_DIR must not be flagged as orphans."""
+        bundle_file = paperless_dirs.share_link_bundles / "my-bundle.zip"
+        bundle_file.write_bytes(b"fake zip content")
+        messages = check_sanity()
+        assert not messages.has_warning
+        assert not any(
+            "my-bundle.zip" in m["message"]
+            for pk in messages.document_pks()
+            for m in messages[pk]
+        )
+
+    def test_orphan_message_includes_category(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        (paperless_dirs.originals / "orphan.pdf").touch()
+        messages = check_sanity()
+        assert any(
+            "originals" in m["message"] for m in messages[None]
+        )
+
+    def test_orphan_summary_attached(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        (paperless_dirs.originals / "orphan.pdf").write_bytes(b"x" * 100)
+        messages = check_sanity()
+        orphan_summary: OrphanSummary = messages.orphan_summary
+        assert orphan_summary is not None
+        assert orphan_summary.total_count == 1
+        assert orphan_summary.total_size == 100
+        assert "originals" in orphan_summary.by_category
+
 
 @pytest.mark.django_db
 class TestCheckSanityIterWrapper:
@@ -263,3 +311,239 @@ class TestCheckSanityLogMessages:
             messages.log_messages()
         assert "#99999" in caplog.text
         assert "Unknown" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Orphan analysis unit tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestClassifyOrphan:
+    @pytest.mark.usefixtures("_media_settings")
+    def test_classify_originals(self, paperless_dirs: PaperlessDirs) -> None:
+        f = paperless_dirs.originals / "stray.pdf"
+        f.touch()
+        assert _classify_orphan(f) == "originals"
+
+    @pytest.mark.usefixtures("_media_settings")
+    def test_classify_archive(self, paperless_dirs: PaperlessDirs) -> None:
+        f = paperless_dirs.archive / "stray.pdf"
+        f.touch()
+        assert _classify_orphan(f) == "archive"
+
+    @pytest.mark.usefixtures("_media_settings")
+    def test_classify_thumbnails(self, paperless_dirs: PaperlessDirs) -> None:
+        f = paperless_dirs.thumbnails / "stray.webp"
+        f.touch()
+        assert _classify_orphan(f) == "thumbnails"
+
+    @pytest.mark.usefixtures("_media_settings")
+    def test_classify_other(self, paperless_dirs: PaperlessDirs) -> None:
+        f = paperless_dirs.media / "random_file.txt"
+        f.touch()
+        assert _classify_orphan(f) == "other"
+
+
+@pytest.mark.usefixtures("_media_settings")
+class TestBuildOrphanSummary:
+    def test_empty_set(self) -> None:
+        summary = _build_orphan_summary(set())
+        assert summary.total_count == 0
+        assert summary.total_size == 0
+        assert not summary.has_orphans
+
+    def test_single_file(self, paperless_dirs: PaperlessDirs) -> None:
+        f = paperless_dirs.originals / "test.pdf"
+        f.write_bytes(b"x" * 500)
+
+        summary = _build_orphan_summary({f})
+        assert summary.total_count == 1
+        assert summary.total_size == 500
+        assert summary.has_orphans
+        assert "originals" in summary.by_category
+
+    def test_multiple_categories(self, paperless_dirs: PaperlessDirs) -> None:
+        f1 = paperless_dirs.originals / "orphan1.pdf"
+        f2 = paperless_dirs.archive / "orphan2.pdf"
+        f1.write_bytes(b"a" * 100)
+        f2.write_bytes(b"b" * 200)
+
+        summary = _build_orphan_summary({f1, f2})
+        assert summary.total_count == 2
+        assert summary.total_size == 300
+        assert "originals" in summary.by_category
+        assert "archive" in summary.by_category
+
+
+class TestFormatSize:
+    def test_bytes(self) -> None:
+        assert _format_size(500) == "500 B"
+
+    def test_kilobytes(self) -> None:
+        assert _format_size(2048) == "2.0 KB"
+
+    def test_megabytes(self) -> None:
+        assert _format_size(5 * 1024 * 1024) == "5.0 MB"
+
+    def test_gigabytes(self) -> None:
+        assert _format_size(3 * 1024 * 1024 * 1024) == "3.0 GB"
+
+
+# ---------------------------------------------------------------------------
+# Orphan verification tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_media_settings")
+class TestVerifyOrphans:
+    def test_empty_candidates(self, paperless_dirs: PaperlessDirs) -> None:
+        result = _verify_orphans(set(), scan_start=0.0, lock_held=True)
+        assert result == set()
+
+    def test_nonexistent_file_filtered(self, paperless_dirs: PaperlessDirs) -> None:
+        nonexistent = paperless_dirs.originals / "gone.pdf"
+        result = _verify_orphans(
+            {nonexistent}, scan_start=0.0, lock_held=True
+        )
+        assert nonexistent not in result
+
+    def test_old_file_confirmed(self, paperless_dirs: PaperlessDirs) -> None:
+        f = paperless_dirs.originals / "old.pdf"
+        f.write_bytes(b"data")
+        # scan_start is in the future → file mtime is before scan start
+        result = _verify_orphans(
+            {f}, scan_start=time.time() + 100, lock_held=True
+        )
+        assert f in result
+
+    def test_recent_file_skipped_when_lock_held(
+        self, paperless_dirs: PaperlessDirs
+    ) -> None:
+        f = paperless_dirs.originals / "new.pdf"
+        f.write_bytes(b"data")
+        # scan_start is in the past → file mtime is after scan start
+        result = _verify_orphans(
+            {f}, scan_start=time.time() - 100, lock_held=True
+        )
+        assert f not in result
+
+
+# ---------------------------------------------------------------------------
+# Orphan cleanup tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("_media_settings")
+class TestHandleOrphanCleanup:
+    def test_no_orphans(self) -> None:
+        summary = OrphanSummary()
+        result = handle_orphan_cleanup(summary)
+        assert not result.cleaned_up
+
+    def test_removes_files(self, paperless_dirs: PaperlessDirs) -> None:
+        f = paperless_dirs.originals / "orphan.pdf"
+        f.write_bytes(b"x" * 100)
+
+        summary = OrphanSummary(
+            orphans=[OrphanFileInfo(path=f, category="originals", size=100)],
+            total_count=1,
+            total_size=100,
+        )
+        result = handle_orphan_cleanup(summary)
+        assert result.cleaned_up
+        assert result.freed_bytes == 100
+        assert not f.exists()
+
+    def test_skips_missing_files(self, paperless_dirs: PaperlessDirs) -> None:
+        f = paperless_dirs.originals / "already_gone.pdf"
+        # File doesn't exist
+
+        summary = OrphanSummary(
+            orphans=[OrphanFileInfo(path=f, category="originals", size=50)],
+            total_count=1,
+            total_size=50,
+        )
+        result = handle_orphan_cleanup(summary)
+        assert result.cleaned_up
+        assert result.freed_bytes == 0
+
+
+# ---------------------------------------------------------------------------
+# Progress callback tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestCheckSanityProgressCallback:
+    def test_phases_emitted(self, sample_doc: Document) -> None:
+        phases: list[str] = []
+        check_sanity(progress_callback=phases.append)
+
+        assert "scan_start" in phases
+        assert "scan_complete" in phases
+        assert "documents_start" in phases
+        assert "documents_complete" in phases
+        assert "orphans_start" in phases
+        assert "orphans_complete" in phases
+
+    def test_cleanup_phases_only_when_deleting(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        (paperless_dirs.originals / "orphan.pdf").touch()
+
+        phases_no_delete: list[str] = []
+        check_sanity(progress_callback=phases_no_delete.append)
+        assert "cleanup_start" not in phases_no_delete
+
+        phases_with_delete: list[str] = []
+        check_sanity(
+            progress_callback=phases_with_delete.append,
+            delete_orphans=True,
+        )
+        assert "cleanup_start" in phases_with_delete
+        assert "cleanup_complete" in phases_with_delete
+
+    def test_no_callback_is_safe(self, sample_doc: Document) -> None:
+        """Calling without a progress_callback must not raise."""
+        messages = check_sanity()
+        assert not messages.has_error
+
+
+# ---------------------------------------------------------------------------
+# Delete orphans integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+class TestCheckSanityDeleteOrphans:
+    def test_delete_removes_orphans(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        orphan_path = paperless_dirs.originals / "orphan.pdf"
+        orphan_path.write_bytes(b"orphan content")
+
+        messages = check_sanity(delete_orphans=True)
+        orphan_summary: OrphanSummary = messages.orphan_summary
+
+        assert orphan_summary.cleaned_up
+        assert orphan_summary.freed_bytes > 0
+        assert not orphan_path.exists()
+
+    def test_no_delete_by_default(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        orphan_path = paperless_dirs.originals / "orphan.pdf"
+        orphan_path.write_bytes(b"orphan content")
+
+        messages = check_sanity()
+        orphan_summary: OrphanSummary = messages.orphan_summary
+
+        assert not orphan_summary.cleaned_up
+        assert orphan_path.exists()

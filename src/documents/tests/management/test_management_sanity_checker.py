@@ -1,6 +1,7 @@
 """Tests for the document_sanity_checker management command.
 
-Verifies Rich rendering (table, panel, summary) and end-to-end CLI behavior.
+Verifies Rich rendering (table, panel, summary), orphan report rendering,
+and end-to-end CLI behavior.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from django.core.management import call_command
 from rich.console import Console
 
 from documents.management.commands.document_sanity_checker import Command
+from documents.sanity_checker import OrphanFileInfo
+from documents.sanity_checker import OrphanSummary
 from documents.sanity_checker import SanityCheckMessages
 from documents.tests.factories import DocumentFactory
 
@@ -28,6 +31,15 @@ def _render_to_string(messages: SanityCheckMessages) -> str:
     cmd = Command()
     cmd.console = Console(file=buf, width=120, no_color=True)
     cmd._render_results(messages)
+    return buf.getvalue()
+
+
+def _render_orphans_to_string(orphan_summary: OrphanSummary) -> str:
+    """Render orphan report to a plain string for assertion."""
+    buf = StringIO()
+    cmd = Command()
+    cmd.console = Console(file=buf, width=120, no_color=True)
+    cmd._render_orphan_report(orphan_summary)
     return buf.getvalue()
 
 
@@ -154,6 +166,83 @@ class TestRenderResultsSummary:
 
 
 # ---------------------------------------------------------------------------
+# Orphan report rendering
+# ---------------------------------------------------------------------------
+
+
+class TestRenderOrphanReport:
+    def test_no_orphans_renders_nothing(self) -> None:
+        summary = OrphanSummary()
+        output = _render_orphans_to_string(summary)
+        assert output.strip() == ""
+
+    def test_orphan_table_and_summary(self) -> None:
+        summary = OrphanSummary(
+            orphans=[
+                OrphanFileInfo(
+                    path=Path("/media/documents/originals/stray.pdf"),
+                    category="originals",
+                    size=1024,
+                ),
+            ],
+            by_category={"originals": {"count": 1, "size": 1024}},
+            total_count=1,
+            total_size=1024,
+        )
+        output = _render_orphans_to_string(summary)
+        assert "Orphaned Files" in output
+        assert "originals" in output
+        assert "1.0 KB" in output
+        assert "Orphan Summary" in output
+        assert "--delete-orphans" in output
+
+    def test_cleanup_results(self) -> None:
+        summary = OrphanSummary(
+            orphans=[
+                OrphanFileInfo(
+                    path=Path("/media/documents/originals/stray.pdf"),
+                    category="originals",
+                    size=2048,
+                ),
+            ],
+            by_category={"originals": {"count": 1, "size": 2048}},
+            total_count=1,
+            total_size=2048,
+            cleaned_up=True,
+            freed_bytes=2048,
+        )
+        output = _render_orphans_to_string(summary)
+        assert "Cleaned up" in output
+        assert "freed" in output
+        assert "--delete-orphans" not in output
+
+    def test_multiple_categories(self) -> None:
+        summary = OrphanSummary(
+            orphans=[
+                OrphanFileInfo(
+                    path=Path("/media/documents/originals/a.pdf"),
+                    category="originals",
+                    size=100,
+                ),
+                OrphanFileInfo(
+                    path=Path("/media/documents/archive/b.pdf"),
+                    category="archive",
+                    size=200,
+                ),
+            ],
+            by_category={
+                "originals": {"count": 1, "size": 100},
+                "archive": {"count": 1, "size": 200},
+            },
+            total_count=2,
+            total_size=300,
+        )
+        output = _render_orphans_to_string(summary)
+        assert "originals" in output
+        assert "archive" in output
+
+
+# ---------------------------------------------------------------------------
 # End-to-end command execution
 # ---------------------------------------------------------------------------
 
@@ -206,3 +295,44 @@ class TestDocumentSanityCheckerCommand:
         output = out.getvalue()
         assert "ERROR" in output
         assert "Checksum mismatch. Stored: abc, actual:" in output
+
+    def test_orphan_report_shown(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        """Orphaned files trigger the orphan report panel."""
+        (paperless_dirs.originals / "orphan.pdf").write_bytes(b"orphan data")
+        out = StringIO()
+        call_command(
+            "document_sanity_checker",
+            "--no-progress-bar",
+            stdout=out,
+            skip_checks=True,
+        )
+        output = out.getvalue()
+        assert "Orphaned Files" in output
+        assert "orphan.pdf" in output
+        assert "Orphan Summary" in output
+
+    def test_delete_orphans_flag(
+        self,
+        sample_doc: Document,
+        paperless_dirs: PaperlessDirs,
+    ) -> None:
+        """--delete-orphans removes orphan files from the media directory."""
+        orphan_path = paperless_dirs.originals / "orphan.pdf"
+        orphan_path.write_bytes(b"orphan data")
+
+        out = StringIO()
+        call_command(
+            "document_sanity_checker",
+            "--no-progress-bar",
+            "--delete-orphans",
+            stdout=out,
+            skip_checks=True,
+            stdin=StringIO("y\n"),  # Confirm deletion
+        )
+        output = out.getvalue()
+        assert "Cleaned up" in output
+        assert not orphan_path.exists()

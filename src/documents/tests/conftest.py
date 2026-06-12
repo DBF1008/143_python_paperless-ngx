@@ -29,6 +29,7 @@ class PaperlessDirs:
     originals: Path
     archive: Path
     thumbnails: Path
+    share_link_bundles: Path
 
 
 @pytest.fixture(scope="session")
@@ -46,8 +47,9 @@ def paperless_dirs(tmp_path: Path) -> PaperlessDirs:
         originals=media / "documents" / "originals",
         archive=media / "documents" / "archive",
         thumbnails=media / "documents" / "thumbnails",
+        share_link_bundles=media / "documents" / "share_link_bundles",
     )
-    for d in (dirs.originals, dirs.archive, dirs.thumbnails):
+    for d in (dirs.originals, dirs.archive, dirs.thumbnails, dirs.share_link_bundles):
         d.mkdir(parents=True)
     return dirs
 
@@ -59,6 +61,7 @@ def _media_settings(paperless_dirs: PaperlessDirs, settings) -> None:
     settings.ORIGINALS_DIR = paperless_dirs.originals
     settings.ARCHIVE_DIR = paperless_dirs.archive
     settings.THUMBNAIL_DIR = paperless_dirs.thumbnails
+    settings.SHARE_LINK_BUNDLE_DIR = paperless_dirs.share_link_bundles
     settings.MEDIA_LOCK = paperless_dirs.media / "media.lock"
     settings.IGNORABLE_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
     settings.APP_LOGO = ""
