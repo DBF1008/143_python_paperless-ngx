@@ -167,6 +167,22 @@ def match_storage_paths(document: Document, classifier: DocumentClassifier, user
 
 
 def matches(matching_model: MatchingModel, document: Document):
+    # filter_expression takes priority over legacy match/matching_algorithm
+    if getattr(matching_model, "filter_expression", None):
+        from documents.filter_engine import FilterContext, evaluate_filter_expression
+
+        try:
+            return evaluate_filter_expression(
+                matching_model.filter_expression,
+                document,
+                FilterContext(fail_closed=False),
+            )
+        except Exception:
+            logger.exception(
+                "filter_expression evaluation failed for %s, falling back to legacy",
+                type(matching_model).__name__,
+            )
+
     search_flags = 0
 
     document_content = document.get_effective_content() or ""
@@ -291,6 +307,27 @@ def consumable_document_matches_workflow(
     False otherwise. Includes a reason if doesn't match
     """
 
+    # filter_expression takes priority over legacy flat filter fields
+    if trigger.filter_expression:
+        from documents.filter_engine import FilterContext, evaluate_filter_expression
+
+        try:
+            result = evaluate_filter_expression(
+                trigger.filter_expression,
+                document,
+                FilterContext(fail_closed=False),  # lenient at consumption time
+            )
+            return (
+                result,
+                "" if result else "Document did not match filter expression",
+            )
+        except Exception:
+            logger.exception(
+                "filter_expression evaluation failed for trigger %s, "
+                "falling back to legacy",
+                trigger.pk,
+            )
+
     trigger_matched = True
     reason = ""
 
@@ -364,6 +401,27 @@ def existing_document_matches_workflow(
     Returns True if the Document matches all filters from the workflow trigger,
     False otherwise. Includes a reason if doesn't match
     """
+
+    # filter_expression takes priority over legacy flat filter fields
+    if trigger.filter_expression:
+        from documents.filter_engine import FilterContext, evaluate_filter_expression
+
+        try:
+            result = evaluate_filter_expression(
+                trigger.filter_expression,
+                document,
+                FilterContext(fail_closed=True),  # strict for saved documents
+            )
+            return (
+                result,
+                None if result else "Document did not match filter expression",
+            )
+        except Exception:
+            logger.exception(
+                "filter_expression evaluation failed for trigger %s, "
+                "falling back to legacy",
+                trigger.pk,
+            )
 
     # Check content matching algorithm
     if trigger.matching_algorithm > MatchingModel.MATCH_NONE and not matches(
@@ -562,6 +620,21 @@ def prefilter_documents_by_workflowtrigger(
     documents by the workflow trigger filters. This is done before e.g.
     document_matches_workflow in run_workflows
     """
+
+    # filter_expression takes priority over legacy flat filter fields
+    if trigger.filter_expression:
+        from documents.filter_engine import build_queryset_from_expression
+
+        try:
+            return build_queryset_from_expression(
+                documents, trigger.filter_expression,
+            )
+        except Exception:
+            logger.exception(
+                "filter_expression queryset build failed for trigger %s, "
+                "falling back to legacy",
+                trigger.pk,
+            )
 
     # Filter for documents that have AT LEAST ONE of the specified tags.
     if trigger.filter_has_tags.exists():

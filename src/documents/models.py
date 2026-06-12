@@ -74,6 +74,16 @@ class MatchingModel(ModelWithOwner):
 
     is_insensitive = models.BooleanField(_("is insensitive"), default=True)
 
+    filter_expression = models.JSONField(
+        _("filter expression"),
+        null=True,
+        blank=True,
+        help_text=_(
+            "JSON-encoded composable filter expression. "
+            "When set, takes priority over match/matching_algorithm fields.",
+        ),
+    )
+
     class Meta(ModelWithOwner.Meta):
         abstract = True
         ordering = ("name",)
@@ -1423,6 +1433,16 @@ class WorkflowTrigger(models.Model):
         null=True,
         blank=True,
         help_text=_("JSON-encoded custom field query expression."),
+    )
+
+    filter_expression = models.JSONField(
+        _("filter expression"),
+        null=True,
+        blank=True,
+        help_text=_(
+            "JSON-encoded composable filter expression. "
+            "When set, takes priority over flat filter fields.",
+        ),
     )
 
     schedule_offset_days = models.IntegerField(
