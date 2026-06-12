@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -14,6 +15,7 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
@@ -28,6 +30,8 @@ from documents.models import StoragePath
 from documents.models import Tag
 from documents.permissions import set_permissions_for_object
 from documents.plugins.helpers import DocumentsStatusManager
+from documents.plugins.helpers import ProgressManager
+from documents.plugins.helpers import ProgressStatusOptions
 from documents.tasks import bulk_update_documents
 from documents.tasks import consume_file
 from documents.tasks import update_document_content_maybe_archive_file
@@ -113,6 +117,8 @@ def _resolve_root_and_source_doc(
 def set_correspondent(
     doc_ids: list[int],
     correspondent: Correspondent,
+    *,
+    defer_index_update: bool = False,
 ) -> Literal["OK"]:
     if correspondent:
         correspondent = Correspondent.objects.only("pk").get(id=correspondent)
@@ -125,15 +131,21 @@ def set_correspondent(
     affected_docs = list(qs.values_list("pk", flat=True))
     qs.update(correspondent=correspondent)
 
-    bulk_update_documents.apply_async(
-        kwargs={"document_ids": affected_docs},
-        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
-    )
+    if not defer_index_update:
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": affected_docs},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
 
     return "OK"
 
 
-def set_storage_path(doc_ids: list[int], storage_path: StoragePath) -> Literal["OK"]:
+def set_storage_path(
+    doc_ids: list[int],
+    storage_path: StoragePath,
+    *,
+    defer_index_update: bool = False,
+) -> Literal["OK"]:
     if storage_path:
         storage_path = StoragePath.objects.only("pk").get(id=storage_path)
 
@@ -147,15 +159,21 @@ def set_storage_path(doc_ids: list[int], storage_path: StoragePath) -> Literal["
     affected_docs = list(qs.values_list("pk", flat=True))
     qs.update(storage_path=storage_path)
 
-    bulk_update_documents.apply_async(
-        kwargs={"document_ids": affected_docs},
-        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
-    )
+    if not defer_index_update:
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": affected_docs},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
 
     return "OK"
 
 
-def set_document_type(doc_ids: list[int], document_type: DocumentType) -> Literal["OK"]:
+def set_document_type(
+    doc_ids: list[int],
+    document_type: DocumentType,
+    *,
+    defer_index_update: bool = False,
+) -> Literal["OK"]:
     if document_type:
         document_type = DocumentType.objects.only("pk").get(id=document_type)
 
@@ -167,15 +185,21 @@ def set_document_type(doc_ids: list[int], document_type: DocumentType) -> Litera
     affected_docs = list(qs.values_list("pk", flat=True))
     qs.update(document_type=document_type)
 
-    bulk_update_documents.apply_async(
-        kwargs={"document_ids": affected_docs},
-        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
-    )
+    if not defer_index_update:
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": affected_docs},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
 
     return "OK"
 
 
-def add_tag(doc_ids: list[int], tag: int) -> Literal["OK"]:
+def add_tag(
+    doc_ids: list[int],
+    tag: int,
+    *,
+    defer_index_update: bool = False,
+) -> Literal["OK"]:
     tag_obj = Tag.objects.get(pk=tag)
     tags_to_add = [tag_obj, *tag_obj.get_ancestors()]
 
@@ -195,7 +219,7 @@ def add_tag(doc_ids: list[int], tag: int) -> Literal["OK"]:
     if to_create:
         DocumentTagRelationship.objects.bulk_create(to_create)
 
-    if affected_docs:
+    if affected_docs and not defer_index_update:
         bulk_update_documents.apply_async(
             kwargs={"document_ids": list(affected_docs)},
             headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
@@ -204,7 +228,12 @@ def add_tag(doc_ids: list[int], tag: int) -> Literal["OK"]:
     return "OK"
 
 
-def remove_tag(doc_ids: list[int], tag: int) -> Literal["OK"]:
+def remove_tag(
+    doc_ids: list[int],
+    tag: int,
+    *,
+    defer_index_update: bool = False,
+) -> Literal["OK"]:
     tag_obj = Tag.objects.get(pk=tag)
     tag_ids = [tag_obj.id, *tag_obj.get_descendants_pks()]
 
@@ -216,7 +245,7 @@ def remove_tag(doc_ids: list[int], tag: int) -> Literal["OK"]:
     affected_docs = list(qs.values_list("document_id", flat=True).distinct())
     qs.delete()
 
-    if affected_docs:
+    if affected_docs and not defer_index_update:
         bulk_update_documents.apply_async(
             kwargs={"document_ids": affected_docs},
             headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
@@ -229,6 +258,8 @@ def modify_tags(
     doc_ids: list[int],
     add_tags: list[int],
     remove_tags: list[int],
+    *,
+    defer_index_update: bool = False,
 ) -> Literal["OK"]:
     qs = Document.objects.filter(id__in=doc_ids).only("pk")
     affected_docs = list(qs.values_list("pk", flat=True))
@@ -277,7 +308,7 @@ def modify_tags(
                     ignore_conflicts=True,
                 )
 
-    if affected_docs:
+    if affected_docs and not defer_index_update:
         bulk_update_documents.apply_async(
             kwargs={"document_ids": affected_docs},
             headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
@@ -290,6 +321,8 @@ def modify_custom_fields(
     doc_ids: list[int],
     add_custom_fields: list[int] | dict,
     remove_custom_fields: list[int],
+    *,
+    defer_index_update: bool = False,
 ) -> Literal["OK"]:
     qs = Document.objects.filter(id__in=doc_ids).only("pk")
     affected_docs = list(qs.values_list("pk", flat=True))
@@ -350,10 +383,11 @@ def modify_custom_fields(
         field_id__in=remove_custom_fields,
     ).hard_delete()
 
-    bulk_update_documents.apply_async(
-        kwargs={"document_ids": affected_docs},
-        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
-    )
+    if not defer_index_update:
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": affected_docs},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
 
     return "OK"
 
@@ -410,6 +444,7 @@ def set_permissions(
     *,
     owner: User | None = None,
     merge: bool = False,
+    defer_index_update: bool = False,
 ) -> Literal["OK"]:
     qs = Document.objects.filter(id__in=doc_ids).select_related("owner")
 
@@ -424,12 +459,305 @@ def set_permissions(
 
     affected_docs = list(qs.values_list("pk", flat=True))
 
-    bulk_update_documents.apply_async(
-        kwargs={"document_ids": affected_docs},
-        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
-    )
+    if not defer_index_update:
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": affected_docs},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
 
     return "OK"
+
+
+def _chunks(seq: list[int], size: int) -> "list[list[int]]":
+    return [seq[i : i + size] for i in range(0, len(seq), size)]
+
+
+def detect_version_conflicts(
+    doc_ids: list[int],
+    expected_versions: Mapping[int | str, str] | None,
+) -> list[dict]:
+    """
+    Optimistic-lock check. ``expected_versions`` maps a document id to the
+    ISO8601 ``modified`` timestamp the client last observed. A conflict is
+    reported when the current ``modified`` differs (or the document no longer
+    exists). An empty/absent map disables the check and returns ``[]``.
+    """
+    if not expected_versions:
+        return []
+
+    target_ids = set(doc_ids)
+    expected_by_id: dict[int, str] = {}
+    for raw_key, raw_val in expected_versions.items():
+        try:
+            doc_id = int(raw_key)
+        except (TypeError, ValueError):
+            continue
+        if doc_id in target_ids:
+            expected_by_id[doc_id] = raw_val
+
+    if not expected_by_id:
+        return []
+
+    current = dict(
+        Document.objects.filter(id__in=expected_by_id.keys()).values_list(
+            "pk",
+            "modified",
+        ),
+    )
+
+    conflicts: list[dict] = []
+    for doc_id, expected_raw in expected_by_id.items():
+        actual = current.get(doc_id)
+        if actual is None:
+            # Document was deleted since the client read it.
+            conflicts.append(
+                {"id": doc_id, "expected": expected_raw, "actual": None},
+            )
+            continue
+
+        expected_dt = parse_datetime(expected_raw) if expected_raw else None
+        if expected_dt is None:
+            conflicts.append(
+                {"id": doc_id, "expected": expected_raw, "actual": actual.isoformat()},
+            )
+            continue
+        if timezone.is_naive(expected_dt) and timezone.is_aware(actual):
+            expected_dt = timezone.make_aware(expected_dt, actual.tzinfo)
+
+        if actual != expected_dt:
+            conflicts.append(
+                {"id": doc_id, "expected": expected_raw, "actual": actual.isoformat()},
+            )
+
+    return conflicts
+
+
+def _trigger_index_update(document_ids: list[int]) -> None:
+    if document_ids:
+        bulk_update_documents.apply_async(
+            kwargs={"document_ids": document_ids},
+            headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+        )
+
+
+def _run_bulk_edit_transactional(
+    method: Callable[..., str],
+    doc_ids: list[int],
+    parameters: dict,
+    expected_versions: Mapping[int | str, str] | None,
+    chunk_size: int,
+    report: Callable[[ProgressStatusOptions, str, int], None],
+    total: int,
+) -> dict:
+    conflicts = detect_version_conflicts(doc_ids, expected_versions)
+    if conflicts:
+        return {
+            "result": "CONFLICT",
+            "updated_count": 0,
+            "skipped": sorted(c["id"] for c in conflicts),
+            "conflicts": conflicts,
+            "errors": [],
+        }
+
+    try:
+        with transaction.atomic():
+            done = 0
+            for chunk in _chunks(doc_ids, chunk_size):
+                method(chunk, **parameters, defer_index_update=True)
+                done += len(chunk)
+                report(
+                    ProgressStatusOptions.WORKING,
+                    f"Processed {done}/{total}",
+                    done,
+                )
+            Document.objects.filter(id__in=doc_ids).update(modified=timezone.now())
+            transaction.on_commit(lambda: _trigger_index_update(doc_ids))
+    except Exception as e:
+        logger.exception(f"Transactional bulk edit failed, rolling back: {e}")
+        return {
+            "result": "FAILED",
+            "updated_count": 0,
+            "skipped": [],
+            "conflicts": [],
+            "errors": [{"ids": doc_ids, "message": str(e)}],
+        }
+
+    return {
+        "result": "OK",
+        "updated_count": total,
+        "skipped": [],
+        "conflicts": [],
+        "errors": [],
+    }
+
+
+def _run_bulk_edit_non_transactional(
+    method: Callable[..., str],
+    doc_ids: list[int],
+    parameters: dict,
+    expected_versions: Mapping[int | str, str] | None,
+    chunk_size: int,
+    report: Callable[[ProgressStatusOptions, str, int], None],
+    total: int,
+) -> dict:
+    conflicts = detect_version_conflicts(doc_ids, expected_versions)
+    conflict_ids = {c["id"] for c in conflicts}
+    target_ids = [d for d in doc_ids if d not in conflict_ids]
+
+    successful_ids: list[int] = []
+    errors: list[dict] = []
+    done = 0
+    for chunk in _chunks(target_ids, chunk_size):
+        try:
+            method(chunk, **parameters, defer_index_update=True)
+            successful_ids.extend(chunk)
+        except Exception as e:
+            logger.exception(f"Bulk edit chunk failed, skipping {chunk}: {e}")
+            errors.append({"ids": list(chunk), "message": str(e)})
+        done += len(chunk)
+        report(ProgressStatusOptions.WORKING, f"Processed {done}/{total}", done)
+
+    if successful_ids:
+        Document.objects.filter(id__in=successful_ids).update(
+            modified=timezone.now(),
+        )
+        _trigger_index_update(successful_ids)
+
+    result = "PARTIAL" if (conflicts or errors) else "OK"
+    return {
+        "result": result,
+        "updated_count": len(successful_ids),
+        "skipped": sorted(conflict_ids),
+        "conflicts": conflicts,
+        "errors": errors,
+    }
+
+
+def run_bulk_edit(
+    method: Callable[..., str],
+    doc_ids: list[int],
+    parameters: dict,
+    *,
+    transactional: bool = False,
+    expected_versions: Mapping[int | str, str] | None = None,
+    progress_task_id: str | None = None,
+    chunk_size: int = 200,
+) -> dict:
+    """
+    Single source of truth for executing a field-class bulk edit with optional
+    all-or-nothing transaction semantics, optimistic-lock conflict detection
+    and (when ``progress_task_id`` is provided) websocket progress reporting.
+
+    Because ``QuerySet.update()`` does not bump the ``auto_now`` ``modified``
+    field, this explicitly bumps ``modified`` on successfully edited documents so
+    concurrent edits can detect each other via the optimistic-lock check.
+    """
+    doc_ids = list(doc_ids)
+    total = len(doc_ids)
+    parameters = dict(parameters or {})
+
+    progress = (
+        ProgressManager(filename=method.__name__, task_id=progress_task_id)
+        if progress_task_id
+        else None
+    )
+
+    def report(status: ProgressStatusOptions, message: str, current: int) -> None:
+        if progress is not None:
+            progress.send_progress(status, message, current, max(total, 1))
+
+    try:
+        report(ProgressStatusOptions.STARTED, "Starting bulk edit", 0)
+
+        if transactional:
+            result = _run_bulk_edit_transactional(
+                method,
+                doc_ids,
+                parameters,
+                expected_versions,
+                chunk_size,
+                report,
+                total,
+            )
+        else:
+            result = _run_bulk_edit_non_transactional(
+                method,
+                doc_ids,
+                parameters,
+                expected_versions,
+                chunk_size,
+                report,
+                total,
+            )
+
+        final_status = (
+            ProgressStatusOptions.SUCCESS
+            if result["result"] in ("OK", "PARTIAL")
+            else ProgressStatusOptions.FAILED
+        )
+        report(final_status, result["result"], total)
+        return result
+    finally:
+        if progress is not None:
+            progress.close()
+
+
+# Maps the serialized method name to the field-class bulk edit function.
+_FIELD_BULK_METHODS: dict[str, Callable[..., str]] = {
+    "set_correspondent": set_correspondent,
+    "set_document_type": set_document_type,
+    "set_storage_path": set_storage_path,
+    "add_tag": add_tag,
+    "remove_tag": remove_tag,
+    "modify_tags": modify_tags,
+    "modify_custom_fields": modify_custom_fields,
+    "set_permissions": set_permissions,
+}
+
+# Methods whose parameters are JSON-serializable and may run in a Celery task.
+# set_permissions is excluded because its validated parameters contain QuerySets
+# which cannot be sent through the broker.
+ASYNC_SAFE_METHODS: frozenset[str] = frozenset(
+    {
+        "set_correspondent",
+        "set_document_type",
+        "set_storage_path",
+        "add_tag",
+        "remove_tag",
+        "modify_tags",
+        "modify_custom_fields",
+    },
+)
+
+
+@shared_task(bind=True)
+def bulk_edit_documents(
+    self,
+    method_name: str,
+    document_ids: list[int],
+    parameters: dict,
+    *,
+    transactional: bool = False,
+    expected_versions: Mapping[int | str, str] | None = None,
+    user_id: int | None = None,
+) -> dict:
+    """
+    Background execution of a field-class bulk edit. Progress is streamed over
+    the existing websocket using this task's id; the returned summary dict is
+    persisted to ``PaperlessTask.result_data`` by the task lifecycle signals.
+    """
+    method = _FIELD_BULK_METHODS.get(method_name)
+    if method is None:
+        raise ValueError(f"Unknown bulk edit method: {method_name}")
+
+    return run_bulk_edit(
+        method,
+        document_ids,
+        parameters,
+        transactional=transactional,
+        expected_versions=expected_versions,
+        progress_task_id=self.request.id,
+    )
 
 
 def rotate(
