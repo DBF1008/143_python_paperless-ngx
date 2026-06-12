@@ -2,6 +2,7 @@ from collections.abc import Iterable
 
 import pytest
 from factory.django import DjangoModelFactory
+from pytest_mock import MockerFixture
 
 from documents import matching
 from documents.models import Document
@@ -347,10 +348,12 @@ class TestMatching:
             ("Don't match this",),
         )
 
-    def test_match_regex_timeout_returns_false(
+    def test_match_regex_unsafe_pattern_returns_false(
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        # A catastrophic-backtracking pattern is rejected up front by the
+        # safety check, before it ever runs against the (large) content.
         tag = TagFactory.build(
             match=r"(a+)+$",
             matching_algorithm=MatchingModel.MATCH_REGEX,
@@ -360,7 +363,43 @@ class TestMatching:
         with caplog.at_level("WARNING", logger="paperless.regex"):
             assert not matching.matches(tag, document)
 
+        assert "unsafe" in caplog.text.lower()
+
+    def test_match_regex_timeout_returns_false(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        mocker: MockerFixture,
+    ) -> None:
+        # A safe pattern that still times out at match time falls back to
+        # "no match" -- the timeout is the runtime backstop behind detection.
+        mock_compile = mocker.patch("documents.regex.regex.compile")
+        mock_compile.return_value.search.side_effect = TimeoutError
+        tag = TagFactory.build(
+            match=r"\d+",
+            matching_algorithm=MatchingModel.MATCH_REGEX,
+        )
+        document = Document(content="12345")
+
+        with caplog.at_level("WARNING", logger="paperless.regex"):
+            assert not matching.matches(tag, document)
+
         assert "timed out" in caplog.text
+
+    def test_match_content_truncated_to_max_length(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Content beyond the configured cap is not considered when matching.
+        monkeypatch.setattr("documents.matching.MATCH_CONTENT_MAX_LENGTH", 10)
+        tag = TagFactory.build(
+            match=r"needle",
+            matching_algorithm=MatchingModel.MATCH_REGEX,
+        )
+        within = Document(content="needle" + "x" * 50)
+        beyond = Document(content=("x" * 50) + "needle")
+
+        assert matching.matches(tag, within)
+        assert not matching.matches(tag, beyond)
 
     def test_match_fuzzy(
         self,

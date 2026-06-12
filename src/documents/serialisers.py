@@ -83,6 +83,7 @@ from documents.permissions import get_objects_for_user_owner_aware
 from documents.permissions import has_perms_owner_aware
 from documents.permissions import set_permissions_for_object
 from documents.regex import validate_regex_pattern
+from documents.regex import validate_regex_safety
 from documents.templating.filepath import validate_filepath_template_and_render
 from documents.templating.utils import convert_format_str_to_template_format
 from documents.validators import uri_validator
@@ -163,6 +164,14 @@ class MatchingModelSerializer(serializers.ModelSerializer[Any]):
                 logger.debug(f"Invalid regular expression: {e!s}")
                 raise serializers.ValidationError(
                     "Invalid regular expression, see log for details.",
+                )
+            try:
+                validate_regex_safety(match)
+            except ValueError as e:
+                logger.debug(f"Unsafe regular expression: {e!s}")
+                raise serializers.ValidationError(
+                    "Regular expression may cause catastrophic backtracking "
+                    "and was rejected, see log for details.",
                 )
         return match
 

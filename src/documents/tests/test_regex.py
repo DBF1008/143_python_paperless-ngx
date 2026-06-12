@@ -2,11 +2,13 @@ import pytest
 import regex
 from pytest_mock import MockerFixture
 
+from documents.regex import MATCH_CONTENT_MAX_LENGTH
 from documents.regex import safe_regex_finditer
 from documents.regex import safe_regex_match
 from documents.regex import safe_regex_search
 from documents.regex import safe_regex_sub
 from documents.regex import validate_regex_pattern
+from documents.regex import validate_regex_safety
 
 
 class TestValidateRegexPattern:
@@ -16,6 +18,54 @@ class TestValidateRegexPattern:
     def test_invalid_pattern_raises(self) -> None:
         with pytest.raises(ValueError):
             validate_regex_pattern(r"[invalid")
+
+
+class TestValidateRegexSafety:
+    """
+    Conservative detection of nested unbounded quantifiers (ReDoS). Dangerous
+    shapes must raise; legitimate patterns must be left untouched.
+    """
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            pytest.param(r"(a+)+", id="nested-plus-plus"),
+            pytest.param(r"(a*)*", id="nested-star-star"),
+            pytest.param(r"(a+)*", id="nested-plus-star"),
+            pytest.param(r"(.+)+", id="nested-dot-plus"),
+            pytest.param(r"(\w+)*", id="nested-word-star"),
+            pytest.param(r"([a-z]+)*", id="nested-class-star"),
+            pytest.param(r"(\d{2,})+", id="nested-openrange-plus"),
+            pytest.param(r"(a+)+$", id="nested-anchored"),
+            pytest.param(r"(?:a+)+", id="nested-noncapturing"),
+        ],
+    )
+    def test_unsafe_pattern_raises(self, pattern) -> None:
+        with pytest.raises(ValueError):
+            validate_regex_safety(pattern)
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            pytest.param(r"\d+", id="simple-digits"),
+            pytest.param(r"\w+", id="simple-word"),
+            pytest.param(r"[a-z]+", id="simple-class"),
+            pytest.param(r"(\d+)", id="group-no-outer-quantifier"),
+            pytest.param(r"(abc)+", id="group-no-inner-quantifier"),
+            pytest.param(r"alpha\w+gamma", id="single-quantifier"),
+            pytest.param(r"(\d{4})-(\d{2})", id="bounded-groups"),
+            pytest.param(r"([+*])+", id="charclass-literals"),
+            pytest.param(r"(a{2,5})+", id="bounded-inner-range"),
+            pytest.param(r"(foo|bar)+", id="alternation"),
+        ],
+    )
+    def test_safe_pattern_allowed(self, pattern) -> None:
+        # Must not raise.
+        validate_regex_safety(pattern)
+
+    def test_content_max_length_is_positive_int(self) -> None:
+        assert isinstance(MATCH_CONTENT_MAX_LENGTH, int)
+        assert MATCH_CONTENT_MAX_LENGTH > 0
 
 
 class TestSafeRegexSearchAndMatch:
@@ -92,6 +142,22 @@ class TestSafeRegexSearchAndMatch:
         getattr(mock_compile.return_value, method_name).side_effect = TimeoutError
         assert func(r"\d+", "test") is None
 
+    @pytest.mark.parametrize(
+        "func",
+        [
+            pytest.param(safe_regex_search, id="search"),
+            pytest.param(safe_regex_match, id="match"),
+        ],
+    )
+    def test_unsafe_pattern_returns_none(
+        self,
+        func,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level("WARNING", logger="paperless.regex"):
+            assert func(r"(a+)+", "a" * 20) is None
+        assert "unsafe" in caplog.text.lower()
+
 
 class TestSafeRegexSub:
     @pytest.mark.parametrize(
@@ -114,6 +180,14 @@ class TestSafeRegexSub:
         mock_compile = mocker.patch("documents.regex.regex.compile")
         mock_compile.return_value.sub.side_effect = TimeoutError
         assert safe_regex_sub(r"\d+", "X", "test") is None
+
+    def test_unsafe_pattern_returns_none(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level("WARNING", logger="paperless.regex"):
+            assert safe_regex_sub(r"(a+)+", "X", "a" * 20) is None
+        assert "unsafe" in caplog.text.lower()
 
 
 class TestSafeRegexFinditer:

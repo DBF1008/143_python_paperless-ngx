@@ -20,6 +20,7 @@ from documents.models import Tag
 from documents.models import Workflow
 from documents.models import WorkflowTrigger
 from documents.permissions import get_objects_for_user_owner_aware
+from documents.regex import MATCH_CONTENT_MAX_LENGTH
 from documents.regex import safe_regex_search
 
 if TYPE_CHECKING:
@@ -170,6 +171,10 @@ def matches(matching_model: MatchingModel, document: Document):
     search_flags = 0
 
     document_content = document.get_effective_content() or ""
+
+    # Cap content length to bound the work any matching algorithm performs on
+    # very large documents (e.g. catastrophic-backtracking regex on huge input).
+    document_content = document_content[:MATCH_CONTENT_MAX_LENGTH]
 
     # Check that match is not empty
     if not matching_model.match.strip():
